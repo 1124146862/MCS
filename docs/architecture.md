@@ -15,8 +15,12 @@ This project now follows the required layered structure:
   - application bootstrap only
 - `core/scene`, `core/skeleton`, `core/animation`
   - document-facing prototype models
+- `core/rig`
+  - internal proxy rig data used by AutoPosing and future runtime joint driving
 - `app/document`
   - startup document creation
+- `app/autoposing`
+  - controller state, proxy rig solving, and AutoPosing behavior
 - `infra/importers`
   - FBX runtime asset preparation and Balsam conversion
 - `ui/viewport`, `ui/timeline`, `ui/outliner`, `ui/inspector`

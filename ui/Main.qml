@@ -110,12 +110,18 @@ ApplicationWindow {
                 hoverEnabled: true
                 onClicked: launcherPopup.open()
 
-                contentItem: Text {
-                    text: homeButton.text
-                    color: homeButton.hovered ? "#ffffff" : "#d7d7d7"
-                    font.pixelSize: 16
-                    horizontalAlignment: Text.AlignHCenter
-                    verticalAlignment: Text.AlignVCenter
+                contentItem: Item {
+                    implicitWidth: 18
+                    implicitHeight: 18
+                    Image {
+                        anchors.centerIn: parent
+                        source: "../assets/home.svg"
+                        sourceSize.width: 18
+                        sourceSize.height: 18
+                        smooth: true
+                        antialiasing: true
+                        opacity: homeButton.hovered ? 1.0 : 0.85
+                    }
                 }
 
                 background: Rectangle {
@@ -138,6 +144,40 @@ ApplicationWindow {
             Components.StyledToolButton { text: qsTr("Move") }
             Components.StyledToolButton { text: qsTr("Rotate") }
             Components.StyledToolButton { text: qsTr("Scale") }
+
+            Rectangle {
+                Layout.fillHeight: true
+                Layout.margins: 4
+                Layout.preferredWidth: 1
+                color: "#454545"
+            }
+
+            Components.StyledToolButton {
+                text: qsTr("View")
+                checkable: true
+                checked: root.documentState && root.documentState.currentEditMode === "view"
+                onClicked: root.documentState.setEditMode("view")
+                ToolTip.visible: hovered
+                ToolTip.text: qsTr("View mode")
+            }
+
+            Components.StyledToolButton {
+                text: qsTr("AutoPose")
+                checkable: true
+                checked: root.documentState && root.documentState.currentEditMode === "autoposing"
+                onClicked: root.documentState.setEditMode("autoposing")
+                ToolTip.visible: hovered
+                ToolTip.text: qsTr("AutoPosing mode")
+            }
+
+            Components.StyledToolButton {
+                text: qsTr("Joint")
+                checkable: true
+                checked: root.documentState && root.documentState.currentEditMode === "joint"
+                onClicked: root.documentState.setEditMode("joint")
+                ToolTip.visible: hovered
+                ToolTip.text: qsTr("Joint mode")
+            }
 
             Rectangle {
                 Layout.fillHeight: true

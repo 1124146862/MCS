@@ -10,7 +10,8 @@ Item {
 
     property var documentViewModel: null
     readonly property bool importedModelReady: documentViewModel !== null && documentViewModel.hasGeneratedModel
-    readonly property real horizonRatio: 0.62
+    readonly property bool autoPosingMode: documentViewModel !== null && documentViewModel.isAutoPosingMode
+    readonly property bool jointMode: documentViewModel !== null && documentViewModel.currentEditMode === "joint"
     readonly property real viewportAspectRatio: Math.max(sceneView.width, 1) / Math.max(sceneView.height, 1)
     property bool orthographicView: false
     property bool navigationLocked: false
@@ -144,38 +145,12 @@ Item {
                 anchors.fill: parent
 
                 Rectangle {
-                    anchors.left: parent.left
-                    anchors.right: parent.right
-                    anchors.top: parent.top
-                    height: parent.height * root.horizonRatio
+                    anchors.fill: parent
 
                     gradient: Gradient {
-                        GradientStop { position: 0.0; color: "#5c5d61" }
-                        GradientStop { position: 0.55; color: "#67686c" }
-                        GradientStop { position: 1.0; color: "#6e7075" }
+                        GradientStop { position: 0.0; color: "#5d6065" }
+                        GradientStop { position: 1.0; color: "#70747a" }
                     }
-                }
-
-                Rectangle {
-                    anchors.left: parent.left
-                    anchors.right: parent.right
-                    anchors.top: parent.top
-                    anchors.topMargin: parent.height * root.horizonRatio
-                    anchors.bottom: parent.bottom
-
-                    gradient: Gradient {
-                        GradientStop { position: 0.0; color: "#66696f" }
-                        GradientStop { position: 1.0; color: "#747880" }
-                    }
-                }
-
-                Rectangle {
-                    anchors.left: parent.left
-                    anchors.right: parent.right
-                    y: parent.height * root.horizonRatio
-                    height: 1
-                    color: "#94979d"
-                    opacity: 0.35
                 }
             }
 
@@ -357,6 +332,7 @@ Item {
                 anchors.fill: sceneView
                 enabled: false
                 camera: skeletonOverlayCamera
+                visible: root.jointMode || root.autoPosingMode
 
                 environment: SceneEnvironment {
                     backgroundMode: SceneEnvironment.Transparent
@@ -378,9 +354,31 @@ Item {
                 }
 
                 SkeletonOverlay {
-                    joints: root.documentViewModel ? root.documentViewModel.skeletonJoints : []
-                    bones: root.documentViewModel ? root.documentViewModel.skeletonBones : []
+                    visible: root.jointMode || root.autoPosingMode
+                    joints: root.documentViewModel
+                            ? (root.autoPosingMode
+                               ? root.documentViewModel.autoPosingPreviewJoints
+                               : root.documentViewModel.skeletonJoints)
+                            : []
+                    bones: root.documentViewModel
+                           ? (root.autoPosingMode
+                              ? root.documentViewModel.autoPosingPreviewBones
+                              : root.documentViewModel.skeletonBones)
+                           : []
                 }
+            }
+
+            AutoPosingOverlay {
+                anchors.fill: sceneView
+                sceneView: sceneView
+                cameraOrbit: cameraOrbit
+                cameraDistance: root.cameraDistance
+                fieldOfView: root.orthographicView ? root.isometricFieldOfView : root.perspectiveFieldOfView
+                horizontalFieldOfView: perspectiveCamera.fieldOfViewOrientation === PerspectiveCamera.Horizontal
+                visibleWorldHeight: root.visibleHeightFor(
+                                        root.cameraDistance,
+                                        root.orthographicView ? root.isometricFieldOfView : root.perspectiveFieldOfView)
+                documentViewModel: root.documentViewModel
             }
 
             ViewportCameraController {
@@ -400,140 +398,18 @@ Item {
                 onDistanceChanged: distance => root.cameraDistance = distance
             }
 
-            Rectangle {
+            OrientationGizmo {
                 anchors.right: parent.right
                 anchors.top: parent.top
                 anchors.margins: 20
-                width: 68
-                height: 88
-                radius: 34
-                color: "#1e1e1e"
-                opacity: 0.8
-
-                Rectangle {
-                    anchors.horizontalCenter: parent.horizontalCenter
-                    anchors.top: parent.top
-                    anchors.topMargin: 0
-                    width: 68
-                    height: 68
-                    radius: 34
-                    color: "#2b2d31"
-
-                    Rectangle {
-                        anchors.centerIn: parent
-                        width: 22
-                        height: 22
-                        radius: 2
-                        color: root.orthographicView ? "#d2d3d6" : "#b8babf"
-                        border.color: "#f0f0f0"
-                        border.width: 1
-
-                        MouseArea {
-                            anchors.fill: parent
-                            enabled: !root.navigationLocked
-                            cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
-                            onClicked: root.toggleProjectionMode()
-                        }
-                    }
-
-                    Rectangle {
-                        anchors.horizontalCenter: parent.horizontalCenter
-                        anchors.top: parent.top
-                        anchors.topMargin: 4
-                        width: 20
-                        height: 20
-                        radius: 10
-                        color: "#8bc34a"
-
-                        Label {
-                            anchors.centerIn: parent
-                            text: "Y"
-                            color: "#111111"
-                            font.bold: true
-                            font.pixelSize: 10
-                        }
-
-                        MouseArea {
-                            anchors.fill: parent
-                            enabled: !root.navigationLocked
-                            cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
-                            onClicked: root.toggleYAxisView()
-                        }
-                    }
-
-                    Rectangle {
-                        anchors.verticalCenter: parent.verticalCenter
-                        anchors.right: parent.right
-                        anchors.rightMargin: 4
-                        width: 20
-                        height: 20
-                        radius: 10
-                        color: "#f44336"
-
-                        Label {
-                            anchors.centerIn: parent
-                            text: "X"
-                            color: "#111111"
-                            font.bold: true
-                            font.pixelSize: 10
-                        }
-
-                        MouseArea {
-                            anchors.fill: parent
-                            enabled: !root.navigationLocked
-                            cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
-                            onClicked: root.toggleXAxisView()
-                        }
-                    }
-
-                    Rectangle {
-                        anchors.verticalCenter: parent.verticalCenter
-                        anchors.left: parent.left
-                        anchors.leftMargin: 4
-                        width: 20
-                        height: 20
-                        radius: 10
-                        color: "#3b82f6"
-
-                        Label {
-                            anchors.centerIn: parent
-                            text: "Z"
-                            color: "#111111"
-                            font.bold: true
-                            font.pixelSize: 10
-                        }
-
-                        MouseArea {
-                            anchors.fill: parent
-                            enabled: !root.navigationLocked
-                            cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
-                            onClicked: root.toggleZAxisView()
-                        }
-                    }
-                }
-
-                Rectangle {
-                    anchors.horizontalCenter: parent.horizontalCenter
-                    anchors.bottom: parent.bottom
-                    anchors.bottomMargin: 2
-                    width: 16
-                    height: 16
-                    radius: 3
-                    color: root.navigationLocked ? "#7f8187" : "#3b3d42"
-                    border.color: "#989ba2"
-
-                    Label {
-                        anchors.centerIn: parent
-                        text: root.navigationLocked ? "\uD83D\uDD12" : "\uD83D\uDD13"
-                        font.pixelSize: 10
-                    }
-
-                    MouseArea {
-                        anchors.fill: parent
-                        cursorShape: Qt.PointingHandCursor
-                        onClicked: root.navigationLocked = !root.navigationLocked
-                    }
-                }
+                cameraOrbit: cameraOrbit
+                orthographicView: root.orthographicView
+                navigationLocked: root.navigationLocked
+                onProjectionClicked: root.toggleProjectionMode()
+                onXAxisClicked: root.toggleXAxisView()
+                onYAxisClicked: root.toggleYAxisView()
+                onZAxisClicked: root.toggleZAxisView()
+                onLockClicked: root.navigationLocked = !root.navigationLocked
             }
 
             Rectangle {
@@ -550,9 +426,11 @@ Item {
                     anchors.rightMargin: 12
 
                     Label {
-                        text: root.importedModelReady
-                              ? qsTr("Imported runtime model")
-                              : qsTr("Placeholder model active")
+                        text: root.autoPosingMode
+                              ? qsTr("AutoPosing mode active")
+                              : (root.importedModelReady
+                                 ? qsTr("Imported runtime model")
+                                 : qsTr("Placeholder model active"))
                         color: "#cccccc"
                         font.pixelSize: 11
                     }

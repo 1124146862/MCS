@@ -11,7 +11,8 @@ class AutoPosingControllerModel:
     default_position: tuple[float, float, float]
     visible: bool = True
     active: bool = False
-    locked: bool = False
+    fixed: bool = False
+    always_active: bool = False
     selected: bool = False
 
 

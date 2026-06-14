@@ -1,0 +1,131 @@
+Blender 类软件代码架构建议
+
+一、推荐架构
+
+这类软件不建议用纯 MVC。
+
+更推荐：
+
+- 整体：分层架构
+- UI 层：MVVM 或 MVP
+- 编辑操作：Command
+- 工具逻辑：State Machine
+- 状态同步：Observer / Event Bus
+
+一句话：
+
+以 Document 为中心，UI 只发命令，Core 只管数据。
+
+
+二、推荐分层
+
+1. Core
+
+负责核心数据模型，不依赖 UI。
+
+例如：
+- Scene
+- Skeleton
+- Bone
+- AnimationClip
+- Keyframe
+
+2. App
+
+负责编辑器业务逻辑。
+
+例如：
+- Command
+- Undo / Redo
+- Selection
+- ToolContext
+- Playback
+- DocumentManager
+
+3. UI
+
+负责界面和交互。
+
+例如：
+- Viewport
+- Timeline
+- Inspector
+- Outliner
+
+规则：
+- UI 不直接改 Core
+- UI 只调用 App 层
+
+4. Infra
+
+负责外围能力。
+
+例如：
+- 文件读写
+- 导入导出
+- 后台任务
+- 插件加载
+
+
+三、推荐代码组织
+
+/core
+  scene/
+  skeleton/
+  animation/
+  math/
+
+/app
+  command/
+  undo/
+  selection/
+  tools/
+  document/
+  playback/
+  events/
+
+/ui
+  viewport/
+  timeline/
+  inspector/
+  outliner/
+
+/infra
+  io/
+  importers/
+  exporters/
+  jobs/
+  plugins/
+
+
+四、组织原则
+
+1. Core 不依赖 UI
+2. UI 不直接修改数据
+3. 所有编辑操作尽量走 Command
+4. 一个项目文件对应一个 Document
+5. 工具逻辑单独放在 tools，不要塞进窗口类
+6. 导入导出、后台任务、插件都放到 Infra，不要混进 Core
+
+
+五、最小可用版本
+
+如果先做第一版，建议先搭这几个模块：
+
+- core/scene
+- core/skeleton
+- core/animation
+- app/command
+- app/undo
+- app/document
+- app/selection
+- ui/viewport
+- ui/timeline
+- infra/io
+
+
+六、最终建议
+
+最适合这类软件的组织方式是：
+
+分层架构 + Document Model + Command + Tool State。

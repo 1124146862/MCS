@@ -1,0 +1,24 @@
+[project]
+name = "PySide QtQuick Project"
+
+[tool.pyside6-project]
+files = [
+    "main.py",
+    "项目结构要求.txt",
+    "core/scene/models.py",
+    "core/skeleton/models.py",
+    "core/animation/models.py",
+    "app/document/models.py",
+    "app/document/document_manager.py",
+    "infra/io/paths.py",
+    "infra/importers/runtime_asset_importer.py",
+    "ui/Main.qml",
+    "ui/components/StyledToolButton.qml",
+    "ui/components/StyledTabButton.qml",
+    "ui/viewport/ViewportPanel.qml",
+    "ui/viewport/ViewportCameraController.qml",
+    "ui/timeline/TimelinePanel.qml",
+    "ui/outliner/OutlinerPanel.qml",
+    "ui/inspector/PropertiesPanel.qml",
+    "ui/inspector/DetailsPanel.qml",
+]

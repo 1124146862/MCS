@@ -1,5 +1,6 @@
 from .models import (
     AutoPosingControllerModel,
+    PreviewFrameModel,
     AutoPosingRigModel,
     ControllerTargetModel,
     RetargetJointPoseModel,
@@ -10,6 +11,7 @@ from .models import (
 
 __all__ = [
     "AutoPosingControllerModel",
+    "PreviewFrameModel",
     "AutoPosingRigModel",
     "ControllerTargetModel",
     "RetargetJointPoseModel",

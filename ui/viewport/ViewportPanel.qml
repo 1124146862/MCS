@@ -450,7 +450,11 @@ Item {
                     Item { Layout.fillWidth: true }
 
                     Label {
-                        text: root.documentViewModel ? root.documentViewModel.statusMessage : qsTr("Preparing assets...")
+                        text: root.documentViewModel
+                              ? (root.autoPosingMode
+                                 ? root.documentViewModel.previewStatusMessage
+                                 : root.documentViewModel.statusMessage)
+                              : qsTr("Preparing assets...")
                         color: "#999999"
                         font.pixelSize: 11
                         elide: Text.ElideRight

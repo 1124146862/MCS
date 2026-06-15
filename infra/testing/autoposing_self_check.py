@@ -7,8 +7,14 @@ from PySide6.QtCore import QUrl
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtQml import QQmlComponent, QQmlEngine
 
+from app.autoposing.anatomy_profile import build_humanoid_anatomy_profile
+from app.autoposing.constraints import extract_pose_constraints
+from app.autoposing.pose_prior import PosePriorEstimator
+from app.autoposing.preview_pipeline import AutoPosingPreviewPipeline
 from app.autoposing.runtime_retargeter import RuntimeRetargeter
 from app.autoposing.service import AutoPosingService
+from app.autoposing.solver_adapter import SyncAutoPosingSolverAdapter
+from app.autoposing.support_solver import SupportSolver
 from app.document.document_manager import DocumentManager
 from app.document.models import DocumentModel
 from core.autoposing.models import RetargetPoseModel, SolvedPoseModel
@@ -16,6 +22,7 @@ from core.math import distance
 from core.rig.models import RigModel
 from core.skeleton.models import BoneModel, SkeletonModel
 from infra.runtime.runtime_pose_writer import RuntimePoseWriter
+from ui.viewmodels.document_view_model import DocumentViewModel
 
 
 _CHECKED_LIMB_CHAINS = (
@@ -68,6 +75,8 @@ class CheckContext:
     document: DocumentModel
     service: AutoPosingService
     retargeter: RuntimeRetargeter
+    adapter: SyncAutoPosingSolverAdapter
+    pipeline: AutoPosingPreviewPipeline
     writer: RuntimePoseWriter
     engine: QQmlEngine | None
     component: QQmlComponent | None
@@ -91,6 +100,10 @@ def _bone_from_skeleton(skeleton: SkeletonModel, name: str) -> BoneModel:
 
 def _controller(document: DocumentModel, identifier: str):
     return next(controller for controller in document.autoposing.controllers if controller.identifier == identifier)
+
+
+def _controller_data(controller_rows: list[dict[str, object]], identifier: str) -> dict[str, object]:
+    return next(row for row in controller_rows if row["id"] == identifier)
 
 
 def _effector(solved_pose: SolvedPoseModel, identifier: str):
@@ -128,15 +141,21 @@ def _fresh_context() -> CheckContext:
     document = DocumentManager().open_startup_document()
     service = AutoPosingService()
     retargeter = RuntimeRetargeter()
+    adapter = SyncAutoPosingSolverAdapter(service, retargeter)
     writer = RuntimePoseWriter()
+    pipeline = AutoPosingPreviewPipeline(document, service, adapter, writer)
+    pipeline.prime(document.preview_frame)
     engine, component, runtime_root = _instantiate_runtime_component(document.generated_component_path)
     if runtime_root is not None:
-        writer.bind_runtime_model(runtime_root)
-        writer.apply_retarget_pose(document.retarget_pose)
+        pipeline.bind_runtime_model(runtime_root)
+        document.preview_frame = pipeline.consume_latest_frame()
+        document.posed_skeleton = document.preview_frame.posed_skeleton
     return CheckContext(
         document=document,
         service=service,
         retargeter=retargeter,
+        adapter=adapter,
+        pipeline=pipeline,
         writer=writer,
         engine=engine,
         component=component,
@@ -309,6 +328,260 @@ def _run_twist_distribution_check() -> CheckResult:
     return CheckResult("twist distribution", passed, details)
 
 
+def _run_preview_pipeline_revision_check() -> CheckResult:
+    context = _fresh_context()
+    controller = _controller(context.document, "wrist_l_main")
+    start = controller.target.world_position
+    target_one = (start[0] - 8.0, start[1] + 6.0, start[2] + 5.0)
+    target_two = (start[0] - 18.0, start[1] + 14.0, start[2] + 9.0)
+
+    context.pipeline.begin_drag("wrist_l_main")
+    revision_one = context.pipeline.next_revision()
+    context.pipeline.update_target("wrist_l_main", target_one, revision_one)
+    revision_two = context.pipeline.next_revision()
+    context.pipeline.update_target("wrist_l_main", target_two, revision_two)
+    frame = context.pipeline.request_preview()
+    context.pipeline.end_drag("wrist_l_main")
+
+    latest_frame = context.pipeline.consume_latest_frame()
+    target_ok = _controller(context.document, "wrist_l_main").target.world_position == target_two
+    passed = (
+        frame is not None
+        and frame.revision == revision_two
+        and latest_frame.revision == revision_two
+        and target_ok
+    )
+    details = (
+        f"frame_revision={'n/a' if frame is None else frame.revision}, latest_revision={latest_frame.revision}, "
+        f"final_target={context.document.autoposing.controllers[3].target.world_position}"
+    )
+    return CheckResult("preview pipeline revision", passed, details)
+
+
+def _run_viewmodel_preview_source_check() -> CheckResult:
+    context = _fresh_context()
+    view_model = DocumentViewModel(context.document)
+    if context.runtime_root is not None:
+        view_model.bindRuntimeModel(context.runtime_root)
+
+    controller = _controller(context.document, "wrist_l_main")
+    start = controller.target.world_position
+    preview_target = (start[0] - 16.0, start[1] + 12.0, start[2] + 7.0)
+
+    view_model.beginAutoPosingDrag("wrist_l_main")
+    view_model.previewAutoPosingController("wrist_l_main", *preview_target)
+    view_model._flush_preview_request()
+    solved_before_tamper = _effector(context.document.preview_frame.solved_pose, "wrist_l_main").solved_world_position
+    controller.target.solved_world_position = (999.0, 999.0, 999.0)
+    controller_rows = view_model._autoposing_controller_visuals_data()
+    controller_row = _controller_data(controller_rows, "wrist_l_main")
+    display_tuple = (
+        float(controller_row["displayX"]),
+        float(controller_row["displayY"]),
+        float(controller_row["displayZ"]),
+    )
+
+    view_model.endAutoPosingDrag("wrist_l_main")
+    committed_revision = context.document.preview_frame.revision
+    committed_status = context.document.status_message
+
+    passed = (
+        display_tuple == solved_before_tamper
+        and committed_revision >= 1
+        and "AutoPosing moved: wrist_l_main" in committed_status
+    )
+    details = (
+        f"display={display_tuple}, solved_before_tamper={solved_before_tamper}, "
+        f"committed_revision={committed_revision}, status={committed_status}"
+    )
+    return CheckResult("viewmodel preview frame authority", passed, details)
+
+
+def _run_viewmodel_drag_signal_split_check() -> CheckResult:
+    context = _fresh_context()
+    view_model = DocumentViewModel(context.document)
+
+    handle_emits: list[int] = []
+    preview_emits: list[int] = []
+    autoposing_emits: list[int] = []
+    view_model.autoPosingControllerHandlesChanged.connect(lambda: handle_emits.append(1))
+    view_model.viewportPreviewChanged.connect(lambda: preview_emits.append(1))
+    view_model.autoposingChanged.connect(lambda: autoposing_emits.append(1))
+
+    controller = _controller(context.document, "wrist_l_main")
+    start = controller.target.world_position
+    target_one = (start[0] - 10.0, start[1] + 7.0, start[2] + 4.0)
+    target_two = (start[0] - 22.0, start[1] + 15.0, start[2] + 11.0)
+
+    view_model.beginAutoPosingDrag("wrist_l_main")
+    after_begin_handles = len(handle_emits)
+    after_begin_preview = len(preview_emits)
+
+    view_model.previewAutoPosingController("wrist_l_main", *target_one)
+    view_model.previewAutoPosingController("wrist_l_main", *target_two)
+    after_preview_handles = len(handle_emits)
+    after_preview_preview = len(preview_emits)
+    target_ok = controller.target.world_position == target_two
+
+    view_model._flush_preview_request()
+    after_flush_handles = len(handle_emits)
+    after_flush_preview = len(preview_emits)
+    flushed_revision = context.document.preview_frame.revision
+    flushed_effector = _effector(context.document.preview_frame.solved_pose, "wrist_l_main")
+    visual_row = _controller_data(view_model._autoposing_controller_visuals_data(), "wrist_l_main")
+    visual_ok = (
+        float(visual_row["displayX"]),
+        float(visual_row["displayY"]),
+        float(visual_row["displayZ"]),
+    ) == flushed_effector.solved_world_position
+    skeleton_ok = len(view_model._autoposing_preview_joints_data()) > 0 and len(view_model._autoposing_preview_bones_data()) > 0
+
+    view_model.endAutoPosingDrag("wrist_l_main")
+    handle_row = _controller_data(view_model._autoposing_controller_handles_data(), "wrist_l_main")
+    final_effector = _effector(context.document.preview_frame.solved_pose, "wrist_l_main")
+    handle_ok = (
+        float(handle_row["handleX"]),
+        float(handle_row["handleY"]),
+        float(handle_row["handleZ"]),
+    ) == final_effector.solved_world_position
+
+    passed = (
+        view_model._preview_request_timer.interval() == 16
+        and after_begin_handles == 0
+        and after_begin_preview == 0
+        and after_preview_handles == 0
+        and after_preview_preview == 0
+        and target_ok
+        and after_flush_handles == 0
+        and after_flush_preview == 1
+        and flushed_revision >= 2
+        and visual_ok
+        and skeleton_ok
+        and len(handle_emits) == 1
+        and handle_ok
+        and len(autoposing_emits) >= 2
+    )
+    details = (
+        f"handles={len(handle_emits)}, preview={len(preview_emits)}, "
+        f"revision={context.document.preview_frame.revision}, target_ok={target_ok}, "
+        f"visual_ok={visual_ok}, handle_ok={handle_ok}"
+    )
+    return CheckResult("viewmodel drag signal split", passed, details)
+
+
+def _run_constraint_extraction_check() -> CheckResult:
+    context = _fresh_context()
+    document = context.document
+    wrist = _controller(document, "wrist_l_main")
+    pelvis = _controller(document, "pelvis_main")
+    ankle = _controller(document, "ankle_l_main")
+    wrist.target.world_position = (
+        wrist.target.world_position[0] - 18.0,
+        wrist.target.world_position[1] + 10.0,
+        wrist.target.world_position[2] + 6.0,
+    )
+    wrist.active = True
+    pelvis.fixed = True
+    anatomy = build_humanoid_anatomy_profile(document.skeleton)
+    constraints = extract_pose_constraints(document.autoposing, anatomy)
+
+    passed = (
+        "wrist_l_main" in constraints.positions
+        and "pelvis_main" in constraints.positions
+        and "ankle_l_main" in constraints.positions
+        and "ankle_l_main" in constraints.supports
+        and constraints.positions["wrist_l_main"].strength > 0.0
+        and constraints.positions["pelvis_main"].locked
+        and constraints.positions["pelvis_main"].priority == 100
+        and constraints.supports["ankle_l_main"].locked
+        and "wrist_r_main" not in constraints.positions
+    )
+    details = (
+        f"positions={sorted(constraints.positions)}, supports={sorted(constraints.supports)}, "
+        f"ankle_always_active={ankle.always_active}"
+    )
+    return CheckResult("constraint extraction", passed, details)
+
+
+def _run_anatomy_profile_check() -> CheckResult:
+    context = _fresh_context()
+    anatomy = build_humanoid_anatomy_profile(context.document.skeleton)
+    required = ("pelvis", "spine_05", "head", "upperarm_l", "hand_l", "thigh_l", "foot_l", "foot_r")
+    complete_required = all(anatomy.has(name) for name in required)
+    chains_ok = all(
+        anatomy.chain_available((chain.start_name, chain.mid_name, chain.end_name))
+        for chain in anatomy.limb_chains.values()
+    )
+    support_ok = "foot_l" in anatomy.support_joint_names and "foot_r" in anatomy.support_joint_names
+    passed = complete_required and chains_ok and support_ok and anatomy.length("thigh_l", "foot_l") > 0.0
+    details = (
+        f"required={complete_required}, chains={chains_ok}, supports={anatomy.support_joint_names}, "
+        f"floor_y={anatomy.floor_y:.3f}"
+    )
+    return CheckResult("anatomy profile", passed, details)
+
+
+def _run_pose_prior_anatomy_check() -> CheckResult:
+    context = _fresh_context()
+    document = context.document
+    anatomy = build_humanoid_anatomy_profile(document.skeleton)
+    wrist = _controller(document, "wrist_l_main")
+    wrist_start = wrist.target.world_position
+    wrist.target.world_position = (wrist_start[0] - 70.0, wrist_start[1] + 30.0, wrist_start[2] + 40.0)
+    wrist.active = True
+    constraints = extract_pose_constraints(document.autoposing, anatomy)
+    prior = PosePriorEstimator().estimate(document.skeleton, anatomy, constraints)
+    prior_by_name = {joint.name: joint for joint in prior.joints}
+    chest_delta = distance(prior_by_name["spine_05"].world_position, anatomy.rest("spine_05"))
+    pelvis_delta = distance(prior_by_name["pelvis"].world_position, anatomy.rest("pelvis"))
+
+    ankle = _controller(document, "ankle_l_main")
+    ankle_start = ankle.target.world_position
+    ankle.target.world_position = (ankle_start[0], ankle_start[1] - 100.0, ankle_start[2])
+    constraints = extract_pose_constraints(document.autoposing, anatomy)
+    prior = PosePriorEstimator().estimate(document.skeleton, anatomy, constraints)
+    prior_by_name = {joint.name: joint for joint in prior.joints}
+    foot_above_floor = prior_by_name["foot_l"].world_position[1] >= anatomy.floor_y
+    pelvis_above_floor = prior_by_name["pelvis"].world_position[1] >= anatomy.floor_y
+
+    passed = chest_delta > 1.0 and 0.1 < pelvis_delta < chest_delta and foot_above_floor and pelvis_above_floor
+    details = (
+        f"chest_delta={chest_delta:.3f}, pelvis_delta={pelvis_delta:.3f}, "
+        f"foot_y={prior_by_name['foot_l'].world_position[1]:.3f}, floor_y={anatomy.floor_y:.3f}"
+    )
+    return CheckResult("pose prior anatomy", passed, details)
+
+
+def _run_support_rule_check() -> CheckResult:
+    context = _fresh_context()
+    document = context.document
+    anatomy = build_humanoid_anatomy_profile(document.skeleton)
+    ankle = _controller(document, "ankle_l_main")
+    ankle.target.world_position = (
+        ankle.target.world_position[0],
+        anatomy.floor_y - 50.0,
+        ankle.target.world_position[2],
+    )
+    constraints = extract_pose_constraints(document.autoposing, anatomy)
+    support_solver = SupportSolver()
+    state = support_solver.state_from_constraints(anatomy, constraints)
+    support_target = state.support_targets.get("foot_l")
+    solved_pose = context.service.solve_pose(document.autoposing, document.skeleton)
+    foot = _joint_from_rig(solved_pose.rig, "foot_l")
+    ball = _joint_from_rig(solved_pose.rig, "ball_l")
+    passed = (
+        support_target is not None
+        and support_target[1] >= anatomy.floor_y
+        and foot.world_position[1] >= anatomy.floor_y
+        and ball.world_position[1] >= anatomy.floor_y
+    )
+    details = (
+        f"support_target_y={'n/a' if support_target is None else f'{support_target[1]:.3f}'}, "
+        f"foot_y={foot.world_position[1]:.3f}, ball_y={ball.world_position[1]:.3f}, floor_y={anatomy.floor_y:.3f}"
+    )
+    return CheckResult("support rules", passed, details)
+
+
 def main() -> int:
     _ensure_app()
     checks = [
@@ -317,6 +590,13 @@ def main() -> int:
         _run_far_ankle_check(),
         _run_direction_check(),
         _run_twist_distribution_check(),
+        _run_preview_pipeline_revision_check(),
+        _run_viewmodel_preview_source_check(),
+        _run_viewmodel_drag_signal_split_check(),
+        _run_constraint_extraction_check(),
+        _run_anatomy_profile_check(),
+        _run_pose_prior_anatomy_check(),
+        _run_support_rule_check(),
     ]
 
     print("MCS AutoPosing self-check")

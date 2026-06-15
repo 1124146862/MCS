@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 
 from core.rig.models import RigModel
-from core.skeleton.models import Quat, Vec3
+from core.skeleton.models import Quat, SkeletonModel, Vec3
 
 
 @dataclass(slots=True)
@@ -61,6 +61,17 @@ class RetargetJointPoseModel:
 class RetargetPoseModel:
     joints: list[RetargetJointPoseModel] = field(default_factory=list)
     status_message: str = ""
+
+
+@dataclass(slots=True)
+class PreviewFrameModel:
+    revision: int = 0
+    solved_pose: SolvedPoseModel = field(default_factory=SolvedPoseModel)
+    retarget_pose: RetargetPoseModel = field(default_factory=RetargetPoseModel)
+    posed_skeleton: SkeletonModel = field(default_factory=SkeletonModel)
+    effectors: list[SolvedEffectorModel] = field(default_factory=list)
+    status_message: str = ""
+    timings: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(slots=True)

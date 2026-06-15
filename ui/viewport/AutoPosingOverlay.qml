@@ -176,17 +176,6 @@ Item {
         return Qt.vector3d(fallbackX, fallbackY, fallbackZ)
     }
 
-    function worldDistance(left, right) {
-        return vectorLength(vectorSubtract(left, right))
-    }
-
-    function shouldShowTargetGhost(controller, targetWorldPosition, solvedWorldPosition) {
-        return draggingControllerId === controller.id
-                || controller.clamped
-                || controller.showGhostTarget
-                || worldDistance(targetWorldPosition, solvedWorldPosition) > 0.01
-    }
-
     Keys.onPressed: event => {
         if (!root.autoPosingVisible || root.documentViewModel === null)
             return
@@ -248,7 +237,7 @@ Item {
     }
 
     Repeater {
-        model: root.documentViewModel ? root.documentViewModel.autoPosingControllers : []
+        model: root.documentViewModel ? root.documentViewModel.autoPosingControllerVisuals : []
 
         delegate: Item {
             id: targetGhostItem
@@ -273,7 +262,7 @@ Item {
             visible: root.autoPosingVisible
                      && modelData.visible
                      && projected.z > 0
-                     && root.shouldShowTargetGhost(modelData, targetWorldPosition, solvedWorldPosition)
+                     && (modelData.showGhostTarget || root.draggingControllerId === modelData.id)
             width: ghostDiameter + 8
             height: ghostDiameter + 8
             x: projected.x - width / 2
@@ -295,7 +284,7 @@ Item {
     }
 
     Repeater {
-        model: root.documentViewModel ? root.documentViewModel.autoPosingControllers : []
+        model: root.documentViewModel ? root.documentViewModel.autoPosingControllerVisuals : []
 
         delegate: Item {
             id: controllerItem
@@ -303,17 +292,14 @@ Item {
             required property var modelData
 
             readonly property vector3d displayWorldPosition: Qt.vector3d(
-                                                                 modelData.x,
-                                                                 modelData.y,
-                                                                 modelData.z)
+                                                                 modelData.displayX,
+                                                                 modelData.displayY,
+                                                                 modelData.displayZ)
             readonly property vector3d projected: root.projectPoint(
                                                       displayWorldPosition.x,
                                                       displayWorldPosition.y,
                                                       displayWorldPosition.z)
             readonly property real controllerDiameter: root.controllerSize(modelData)
-            property vector3d dragStartWorldPosition: Qt.vector3d(0, 0, 0)
-            property vector3d dragPlanePoint: Qt.vector3d(0, 0, 0)
-            property vector3d dragPlaneNormal: Qt.vector3d(0, 0, -1)
 
             visible: root.autoPosingVisible && modelData.visible && projected.z > 0
             width: controllerDiameter + 8
@@ -346,31 +332,69 @@ Item {
                                  : root.controllerBorderColor(controllerItem.modelData))
                 border.width: (controllerItem.modelData.selected || root.draggingControllerId === controllerItem.modelData.id) ? 2 : 1
             }
+        }
+    }
+
+    Repeater {
+        model: root.documentViewModel ? root.documentViewModel.autoPosingControllerHandles : []
+
+        delegate: Item {
+            id: handleItem
+
+            required property var modelData
+
+            readonly property vector3d handleWorldPosition: root.draggedPositionOrFallback(
+                                                                 modelData.id,
+                                                                 modelData.handleX,
+                                                                 modelData.handleY,
+                                                                 modelData.handleZ)
+            readonly property vector3d projected: root.projectPoint(
+                                                      handleWorldPosition.x,
+                                                      handleWorldPosition.y,
+                                                      handleWorldPosition.z)
+            readonly property real controllerDiameter: root.controllerSize(modelData)
+            property vector3d dragStartWorldPosition: Qt.vector3d(0, 0, 0)
+            property vector3d dragPlanePoint: Qt.vector3d(0, 0, 0)
+            property vector3d dragPlaneNormal: Qt.vector3d(0, 0, -1)
+
+            visible: root.autoPosingVisible && modelData.visible && projected.z > 0
+            width: controllerDiameter + 14
+            height: controllerDiameter + 14
+            x: projected.x - width / 2
+            y: projected.y - height / 2
+
+            Rectangle {
+                anchors.centerIn: parent
+                width: parent.width
+                height: parent.height
+                radius: width / 2
+                color: "transparent"
+            }
 
             DragHandler {
-                id: controllerDragHandler
+                id: handleDragHandler
 
                 target: null
                 acceptedButtons: Qt.LeftButton
 
                 onActiveChanged: {
                     if (!active) {
-                        root.documentViewModel.endAutoPosingDrag(controllerItem.modelData.id)
+                        root.documentViewModel.endAutoPosingDrag(handleItem.modelData.id)
                         root.draggingControllerId = ""
                         return
                     }
 
                     root.forceActiveFocus()
-                    root.documentViewModel.beginAutoPosingDrag(controllerItem.modelData.id)
-                    root.draggingControllerId = controllerItem.modelData.id
-                    controllerItem.dragStartWorldPosition = Qt.vector3d(
-                        controllerItem.modelData.x,
-                        controllerItem.modelData.y,
-                        controllerItem.modelData.z
+                    root.documentViewModel.beginAutoPosingDrag(handleItem.modelData.id)
+                    root.draggingControllerId = handleItem.modelData.id
+                    handleItem.dragStartWorldPosition = Qt.vector3d(
+                        handleItem.modelData.targetX,
+                        handleItem.modelData.targetY,
+                        handleItem.modelData.targetZ
                     )
-                    controllerItem.dragPlanePoint = controllerItem.dragStartWorldPosition
-                    controllerItem.dragPlaneNormal = root.controllerDragPlaneNormal(controllerItem.modelData)
-                    root.draggingWorldPosition = controllerItem.dragStartWorldPosition
+                    handleItem.dragPlanePoint = handleItem.dragStartWorldPosition
+                    handleItem.dragPlaneNormal = root.controllerDragPlaneNormal(handleItem.modelData)
+                    root.draggingWorldPosition = handleItem.dragStartWorldPosition
                 }
 
                 onCentroidChanged: {
@@ -379,14 +403,14 @@ Item {
 
                     const rootPoint = root.overlayPointFromScenePosition(centroid.scenePosition)
                     const nextScenePosition = root.draggedWorldPosition(
-                        controllerItem.dragStartWorldPosition,
-                        controllerItem.dragPlanePoint,
-                        controllerItem.dragPlaneNormal,
+                        handleItem.dragStartWorldPosition,
+                        handleItem.dragPlanePoint,
+                        handleItem.dragPlaneNormal,
                         rootPoint
                     )
                     root.draggingWorldPosition = nextScenePosition
                     root.documentViewModel.previewAutoPosingController(
-                        controllerItem.modelData.id,
+                        handleItem.modelData.id,
                         nextScenePosition.x,
                         nextScenePosition.y,
                         nextScenePosition.z
@@ -405,12 +429,12 @@ Item {
 
                 onTapped: eventPoint => {
                     root.forceActiveFocus()
-                    root.documentViewModel.selectAutoPosingController(controllerItem.modelData.id)
+                    root.documentViewModel.selectAutoPosingController(handleItem.modelData.id)
                 }
 
                 onDoubleTapped: eventPoint => {
                     root.forceActiveFocus()
-                    root.documentViewModel.selectAutoPosingController(controllerItem.modelData.id)
+                    root.documentViewModel.selectAutoPosingController(handleItem.modelData.id)
                 }
             }
 
@@ -420,7 +444,7 @@ Item {
                 hoverEnabled: true
 
                 ToolTip.visible: containsMouse
-                ToolTip.text: controllerItem.modelData.name
+                ToolTip.text: handleItem.modelData.name
             }
         }
     }

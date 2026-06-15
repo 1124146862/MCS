@@ -10,6 +10,10 @@ from PySide6.QtQml import QQmlComponent, QQmlEngine
 from app.autoposing.anatomy_profile import build_humanoid_anatomy_profile
 from app.autoposing.constraints import extract_pose_constraints
 from app.autoposing.controller_layout import direction_rod_length
+from app.autoposing.joint_rules.ankle import AnkleRule
+from app.autoposing.joint_rules.elbow import ElbowRule
+from app.autoposing.joint_rules.foot import FootRollRule
+from app.autoposing.joint_rules.knee import KneeRule
 from app.autoposing.pose_prior import PosePriorEstimator
 from app.autoposing.preview_pipeline import AutoPosingPreviewPipeline
 from app.autoposing.runtime_retargeter import RuntimeRetargeter
@@ -19,7 +23,7 @@ from app.autoposing.support_solver import SupportSolver
 from app.document.document_manager import DocumentManager
 from app.document.models import DocumentModel
 from core.autoposing.models import RetargetPoseModel, SolvedPoseModel
-from core.math import distance
+from core.math import add, distance, dot, length, normalize, project_on_plane, quaternion_angle_axis, rotate_vector, scale, subtract
 from core.rig.models import RigModel
 from core.skeleton.models import BoneModel, SkeletonModel
 from infra.runtime.runtime_pose_writer import RuntimePoseWriter
@@ -188,6 +192,23 @@ def _chain_length_error(rest: SkeletonModel, solved: RigModel) -> float:
         solved_length = distance(solved_parent.world_position, solved_child.world_position)
         max_error = max(max_error, abs(rest_length - solved_length))
     return max_error
+
+
+def _elbow_flexion_degrees(start: tuple[float, float, float], mid: tuple[float, float, float], end: tuple[float, float, float]) -> float:
+    upper = normalize(subtract(start, mid))
+    lower = normalize(subtract(end, mid))
+    cosine = max(-1.0, min(1.0, dot(upper, lower)))
+    return 180.0 - math.degrees(math.acos(cosine))
+
+
+def _relative_clavicle_delta(document: DocumentModel, side: str) -> float:
+    rest_clavicle = _bone_from_skeleton(document.skeleton, f"clavicle_{side}").rest_world_position
+    rest_chest = _bone_from_skeleton(document.skeleton, "spine_05").rest_world_position
+    solved_clavicle = _joint_from_rig(document.solver_rig, f"clavicle_{side}").world_position
+    solved_chest = _joint_from_rig(document.solver_rig, "spine_05").world_position
+    rest_relative = subtract(rest_clavicle, rest_chest)
+    solved_relative = subtract(solved_clavicle, solved_chest)
+    return length(subtract(solved_relative, rest_relative))
 
 
 def _runtime_alignment_error(runtime_skeleton: SkeletonModel | None, solved_rig: RigModel) -> float | None:
@@ -719,6 +740,120 @@ def _run_shoulder_girdle_check() -> CheckResult:
     return CheckResult("shoulder girdle recruitment", passed, details)
 
 
+def _run_shoulder_girdle_rule_check() -> CheckResult:
+    far_context = _fresh_context()
+    far_document = far_context.document
+    anatomy = build_humanoid_anatomy_profile(far_document.skeleton)
+    wrist = _controller(far_document, "wrist_l_main")
+    wrist_start = wrist.target.world_position
+    far_context.service.move_controller(
+        far_document.autoposing,
+        "wrist_l_main",
+        (wrist_start[0] - 140.0, wrist_start[1] + 90.0, wrist_start[2] + 120.0),
+    )
+    _solve_context(far_context)
+    far_active = _relative_clavicle_delta(far_document, "l")
+    far_opposite = _relative_clavicle_delta(far_document, "r")
+    far_chest = distance(
+        _bone_from_skeleton(far_document.skeleton, "spine_05").rest_world_position,
+        _joint_from_rig(far_document.solver_rig, "spine_05").world_position,
+    )
+    far_pelvis = distance(
+        _bone_from_skeleton(far_document.skeleton, "pelvis").rest_world_position,
+        _joint_from_rig(far_document.solver_rig, "pelvis").world_position,
+    )
+    far_head = distance(
+        _bone_from_skeleton(far_document.skeleton, "head").rest_world_position,
+        _joint_from_rig(far_document.solver_rig, "head").world_position,
+    )
+    far_ok = far_active > anatomy.arm_length("l") * 0.10 and far_chest > far_pelvis and far_head <= far_chest
+
+    side_context = _fresh_context()
+    side_document = side_context.document
+    side_wrist = _controller(side_document, "wrist_l_main")
+    side_start = side_wrist.target.world_position
+    side_context.service.move_controller(
+        side_document.autoposing,
+        "wrist_l_main",
+        (side_start[0] - 160.0, side_start[1] + 15.0, side_start[2] + 10.0),
+    )
+    _solve_context(side_context)
+    side_active = _relative_clavicle_delta(side_document, "l")
+    side_opposite = _relative_clavicle_delta(side_document, "r")
+    side_ok = side_active > anatomy.arm_length("l") * 0.025 and side_active > max(side_opposite * 2.0, 0.01)
+
+    low_context = _fresh_context()
+    low_document = low_context.document
+    low_wrist = _controller(low_document, "wrist_l_main")
+    low_start = low_wrist.target.world_position
+    low_context.service.move_controller(
+        low_document.autoposing,
+        "wrist_l_main",
+        (low_start[0] - 8.0, low_start[1] - 12.0, low_start[2]),
+    )
+    _solve_context(low_context)
+    low_active = _relative_clavicle_delta(low_document, "l")
+    low_ok = low_active < anatomy.arm_length("l") * 0.005
+
+    locked_context = _fresh_context()
+    locked_document = locked_context.document
+    locked_context.service.fix_controller(locked_document.autoposing, "chest_secondary")
+    locked_context.service.fix_controller(locked_document.autoposing, "head_main")
+    locked_context.service.fix_controller(locked_document.autoposing, "pelvis_main")
+    locked_wrist = _controller(locked_document, "wrist_l_main")
+    locked_start = locked_wrist.target.world_position
+    locked_context.service.move_controller(
+        locked_document.autoposing,
+        "wrist_l_main",
+        (locked_start[0] - 140.0, locked_start[1] + 90.0, locked_start[2] + 120.0),
+    )
+    _solve_context(locked_context)
+    locked_chest = distance(
+        _bone_from_skeleton(locked_document.skeleton, "spine_05").rest_world_position,
+        _joint_from_rig(locked_document.solver_rig, "spine_05").world_position,
+    )
+    locked_pelvis = distance(
+        _bone_from_skeleton(locked_document.skeleton, "pelvis").rest_world_position,
+        _joint_from_rig(locked_document.solver_rig, "pelvis").world_position,
+    )
+    locked_head = distance(
+        _bone_from_skeleton(locked_document.skeleton, "head").rest_world_position,
+        _joint_from_rig(locked_document.solver_rig, "head").world_position,
+    )
+    locked_ok = locked_chest <= 0.001 and locked_pelvis <= 0.001 and locked_head <= 0.001
+
+    fixed_context = _fresh_context()
+    fixed_document = fixed_context.document
+    fixed_shoulder = _controller(fixed_document, "shoulder_l_lesser")
+    fixed_wrist = _controller(fixed_document, "wrist_l_main")
+    fixed_start = fixed_wrist.target.world_position
+    fixed_context.service.fix_controller(fixed_document.autoposing, "shoulder_l_lesser", fixed_shoulder.target.world_position)
+    fixed_context.service.move_controller(
+        fixed_document.autoposing,
+        "wrist_l_main",
+        (fixed_start[0] - 140.0, fixed_start[1] + 90.0, fixed_start[2] + 120.0),
+    )
+    _solve_context(fixed_context)
+    fixed_upperarm_drift = distance(
+        fixed_shoulder.target.world_position,
+        _joint_from_rig(fixed_document.solver_rig, "upperarm_l").world_position,
+    )
+    auto_upperarm_drift = distance(
+        _bone_from_skeleton(far_document.skeleton, "upperarm_l").rest_world_position,
+        _joint_from_rig(far_document.solver_rig, "upperarm_l").world_position,
+    )
+    fixed_ok = fixed_upperarm_drift < auto_upperarm_drift * 0.75
+
+    passed = far_ok and side_ok and low_ok and locked_ok and fixed_ok
+    details = (
+        f"far_rel=({far_active:.3f}/{far_opposite:.3f}), far_body=({far_chest:.3f}/{far_pelvis:.3f}/{far_head:.3f}), "
+        f"side_rel=({side_active:.3f}/{side_opposite:.3f}), low_rel={low_active:.3f}, "
+        f"locked=({locked_chest:.3f}/{locked_pelvis:.3f}/{locked_head:.3f}), "
+        f"fixed_upperarm={fixed_upperarm_drift:.3f}, auto_upperarm={auto_upperarm_drift:.3f}"
+    )
+    return CheckResult("shoulder girdle rule", passed, details)
+
+
 def _run_support_stability_check() -> CheckResult:
     context = _fresh_context()
     document = context.document
@@ -749,6 +884,100 @@ def _run_support_stability_check() -> CheckResult:
         f"pelvis_delta={pelvis_delta:.3f}, body_height={anatomy.body_height:.3f}"
     )
     return CheckResult("support foot stability", passed, details)
+
+
+def _run_hip_pelvis_compensation_rule_check() -> CheckResult:
+    context = _fresh_context()
+    document = context.document
+    anatomy = build_humanoid_anatomy_profile(document.skeleton)
+    ankle = _controller(document, "ankle_l_main")
+    start = ankle.target.world_position
+    context.service.move_controller(
+        document.autoposing,
+        "ankle_l_main",
+        (start[0] + 110.0, start[1] + 140.0, start[2] + 90.0),
+    )
+    _solve_context(context)
+    pelvis_delta = distance(
+        _bone_from_skeleton(document.skeleton, "pelvis").rest_world_position,
+        _joint_from_rig(document.solver_rig, "pelvis").world_position,
+    )
+    chest_delta = distance(
+        _bone_from_skeleton(document.skeleton, "spine_05").rest_world_position,
+        _joint_from_rig(document.solver_rig, "spine_05").world_position,
+    )
+    head_delta = distance(
+        _bone_from_skeleton(document.skeleton, "head").rest_world_position,
+        _joint_from_rig(document.solver_rig, "head").world_position,
+    )
+    right_foot_delta = distance(
+        _bone_from_skeleton(document.skeleton, "foot_r").rest_world_position,
+        _joint_from_rig(document.solver_rig, "foot_r").world_position,
+    )
+    right_ball_delta = distance(
+        _bone_from_skeleton(document.skeleton, "ball_r").rest_world_position,
+        _joint_from_rig(document.solver_rig, "ball_r").world_position,
+    )
+    body_ok = pelvis_delta > max(chest_delta * 1.25, anatomy.body_height * 0.005) and head_delta <= max(chest_delta * 1.25, anatomy.body_height * 0.08)
+    support_ok = right_foot_delta < anatomy.body_height * 0.012 and right_ball_delta < anatomy.body_height * 0.015
+
+    locked_context = _fresh_context()
+    locked_document = locked_context.document
+    locked_context.service.fix_controller(locked_document.autoposing, "pelvis_main")
+    locked_context.service.fix_controller(locked_document.autoposing, "chest_secondary")
+    locked_context.service.fix_controller(locked_document.autoposing, "head_main")
+    locked_ankle = _controller(locked_document, "ankle_l_main")
+    locked_start = locked_ankle.target.world_position
+    locked_context.service.move_controller(
+        locked_document.autoposing,
+        "ankle_l_main",
+        (locked_start[0] + 110.0, locked_start[1] + 140.0, locked_start[2] + 90.0),
+    )
+    _solve_context(locked_context)
+    locked_pelvis = distance(
+        _bone_from_skeleton(locked_document.skeleton, "pelvis").rest_world_position,
+        _joint_from_rig(locked_document.solver_rig, "pelvis").world_position,
+    )
+    locked_chest = distance(
+        _bone_from_skeleton(locked_document.skeleton, "spine_05").rest_world_position,
+        _joint_from_rig(locked_document.solver_rig, "spine_05").world_position,
+    )
+    locked_head = distance(
+        _bone_from_skeleton(locked_document.skeleton, "head").rest_world_position,
+        _joint_from_rig(locked_document.solver_rig, "head").world_position,
+    )
+    locked_ok = locked_pelvis <= 0.001 and locked_chest <= 0.001 and locked_head <= 0.001
+
+    fixed_context = _fresh_context()
+    fixed_document = fixed_context.document
+    fixed_hip = _controller(fixed_document, "hip_l_lesser")
+    fixed_ankle = _controller(fixed_document, "ankle_l_main")
+    fixed_start = fixed_ankle.target.world_position
+    fixed_context.service.fix_controller(fixed_document.autoposing, "hip_l_lesser", fixed_hip.target.world_position)
+    fixed_context.service.move_controller(
+        fixed_document.autoposing,
+        "ankle_l_main",
+        (fixed_start[0] + 110.0, fixed_start[1] + 140.0, fixed_start[2] + 90.0),
+    )
+    _solve_context(fixed_context)
+    auto_thigh_drift = distance(
+        _bone_from_skeleton(document.skeleton, "thigh_l").rest_world_position,
+        _joint_from_rig(document.solver_rig, "thigh_l").world_position,
+    )
+    fixed_thigh_drift = distance(
+        fixed_hip.target.world_position,
+        _joint_from_rig(fixed_document.solver_rig, "thigh_l").world_position,
+    )
+    fixed_ok = fixed_thigh_drift < max(auto_thigh_drift * 0.85, anatomy.body_height * 0.01)
+
+    passed = body_ok and support_ok and locked_ok and fixed_ok
+    details = (
+        f"body=({pelvis_delta:.3f}/{chest_delta:.3f}/{head_delta:.3f}), "
+        f"support=({right_foot_delta:.3f}/{right_ball_delta:.3f}), "
+        f"locked=({locked_pelvis:.3f}/{locked_chest:.3f}/{locked_head:.3f}), "
+        f"thigh=(auto {auto_thigh_drift:.3f}/fixed {fixed_thigh_drift:.3f}), body_height={anatomy.body_height:.3f}"
+    )
+    return CheckResult("hip pelvis compensation rule", passed, details)
 
 
 def _run_visual_policy_check() -> CheckResult:
@@ -917,6 +1146,114 @@ def _run_bend_hint_semantics_check() -> CheckResult:
     return CheckResult("bend hint semantics", passed, details)
 
 
+def _run_elbow_bend_plane_rule_check() -> CheckResult:
+    context = _fresh_context()
+    document = context.document
+    upperarm = _bone_from_skeleton(document.skeleton, "upperarm_l")
+    lowerarm = _bone_from_skeleton(document.skeleton, "lowerarm_l")
+    hand = _bone_from_skeleton(document.skeleton, "hand_l")
+    chain_axis = normalize(subtract(hand.rest_world_position, upperarm.rest_world_position))
+    rest_bend = normalize(project_on_plane(subtract(lowerarm.rest_world_position, upperarm.rest_world_position), chain_axis))
+    opposite_hint = add(upperarm.rest_world_position, scale(rest_bend, -max(distance(upperarm.rest_world_position, lowerarm.rest_world_position), 1.0)))
+    rule_result = ElbowRule().solve(
+        start_position=upperarm.rest_world_position,
+        target_position=hand.rest_world_position,
+        raw_hint_position=opposite_hint,
+        fallback_hint_position=lowerarm.rest_world_position,
+        upper_length=distance(upperarm.rest_world_position, lowerarm.rest_world_position),
+        lower_length=distance(lowerarm.rest_world_position, hand.rest_world_position),
+    )
+    direct_ok = (
+        rule_result.pressure_state == "stretch"
+        and abs(rule_result.debug_angles["bend_plane_applied_degrees"]) <= 120.5
+        and abs(rule_result.debug_angles["bend_plane_overflow_degrees"]) > 10.0
+    )
+
+    context.service.move_controller(document.autoposing, "elbow_l_secondary", opposite_hint)
+    _solve_context(context)
+    elbow_effector = _effector(document.solved_pose, "elbow_l_secondary")
+    integrated_ok = elbow_effector.pressure > 0.5 and elbow_effector.pressure_state == "stretch"
+    length_ok = _chain_length_error(document.skeleton, document.solver_rig) <= 0.0015
+
+    close_context = _fresh_context()
+    close_document = close_context.document
+    close_upperarm = _bone_from_skeleton(close_document.skeleton, "upperarm_l")
+    close_hand = _bone_from_skeleton(close_document.skeleton, "hand_l")
+    close_direction = normalize(subtract(close_hand.rest_world_position, close_upperarm.rest_world_position))
+    close_target = add(close_upperarm.rest_world_position, scale(close_direction, 1.0))
+    close_context.service.move_controller(close_document.autoposing, "wrist_l_main", close_target)
+    _solve_context(close_context)
+    solved_upperarm = _joint_from_rig(close_document.solver_rig, "upperarm_l")
+    solved_lowerarm = _joint_from_rig(close_document.solver_rig, "lowerarm_l")
+    solved_hand = _joint_from_rig(close_document.solver_rig, "hand_l")
+    close_flexion = _elbow_flexion_degrees(solved_upperarm.world_position, solved_lowerarm.world_position, solved_hand.world_position)
+    wrist_effector = _effector(close_document.solved_pose, "wrist_l_main")
+    flexion_ok = close_flexion <= 145.5 and wrist_effector.clamped and wrist_effector.pressure_state == "stretch"
+
+    passed = direct_ok and integrated_ok and length_ok and flexion_ok
+    details = (
+        f"plane_applied={rule_result.debug_angles['bend_plane_applied_degrees']:.2f}, "
+        f"plane_overflow={rule_result.debug_angles['bend_plane_overflow_degrees']:.2f}, "
+        f"elbow_pressure={elbow_effector.pressure:.2f}, close_flexion={close_flexion:.2f}, "
+        f"wrist_clamped={wrist_effector.clamped}, length_error={_chain_length_error(document.skeleton, document.solver_rig):.6f}"
+    )
+    return CheckResult("elbow bend plane rule", passed, details)
+
+
+def _run_knee_bend_plane_rule_check() -> CheckResult:
+    context = _fresh_context()
+    document = context.document
+    thigh = _bone_from_skeleton(document.skeleton, "thigh_l")
+    calf = _bone_from_skeleton(document.skeleton, "calf_l")
+    foot = _bone_from_skeleton(document.skeleton, "foot_l")
+    chain_axis = normalize(subtract(foot.rest_world_position, thigh.rest_world_position))
+    rest_bend = normalize(project_on_plane(subtract(calf.rest_world_position, thigh.rest_world_position), chain_axis))
+    opposite_hint = add(thigh.rest_world_position, scale(rest_bend, -max(distance(thigh.rest_world_position, calf.rest_world_position), 1.0)))
+    rule_result = KneeRule().solve(
+        start_position=thigh.rest_world_position,
+        target_position=foot.rest_world_position,
+        raw_hint_position=opposite_hint,
+        fallback_hint_position=calf.rest_world_position,
+        upper_length=distance(thigh.rest_world_position, calf.rest_world_position),
+        lower_length=distance(calf.rest_world_position, foot.rest_world_position),
+    )
+    direct_ok = (
+        rule_result.pressure_state == "stretch"
+        and abs(rule_result.debug_angles["bend_plane_applied_degrees"]) <= 110.5
+        and abs(rule_result.debug_angles["bend_plane_overflow_degrees"]) > 10.0
+    )
+
+    context.service.move_controller(document.autoposing, "knee_l_secondary", opposite_hint)
+    _solve_context(context)
+    knee_effector = _effector(document.solved_pose, "knee_l_secondary")
+    integrated_ok = knee_effector.pressure > 0.5 and knee_effector.pressure_state == "stretch"
+    length_ok = _chain_length_error(document.skeleton, document.solver_rig) <= 0.0015
+
+    close_context = _fresh_context()
+    close_document = close_context.document
+    close_thigh = _bone_from_skeleton(close_document.skeleton, "thigh_l")
+    close_foot = _bone_from_skeleton(close_document.skeleton, "foot_l")
+    close_direction = normalize(subtract(close_foot.rest_world_position, close_thigh.rest_world_position))
+    close_target = add(close_thigh.rest_world_position, scale(close_direction, 1.0))
+    close_context.service.move_controller(close_document.autoposing, "ankle_l_main", close_target)
+    _solve_context(close_context)
+    solved_thigh = _joint_from_rig(close_document.solver_rig, "thigh_l")
+    solved_calf = _joint_from_rig(close_document.solver_rig, "calf_l")
+    solved_foot = _joint_from_rig(close_document.solver_rig, "foot_l")
+    close_flexion = _elbow_flexion_degrees(solved_thigh.world_position, solved_calf.world_position, solved_foot.world_position)
+    ankle_effector = _effector(close_document.solved_pose, "ankle_l_main")
+    flexion_ok = close_flexion <= 140.5 and ankle_effector.clamped and ankle_effector.pressure_state == "stretch"
+
+    passed = direct_ok and integrated_ok and length_ok and flexion_ok
+    details = (
+        f"plane_applied={rule_result.debug_angles['bend_plane_applied_degrees']:.2f}, "
+        f"plane_overflow={rule_result.debug_angles['bend_plane_overflow_degrees']:.2f}, "
+        f"knee_pressure={knee_effector.pressure:.2f}, close_flexion={close_flexion:.2f}, "
+        f"ankle_clamped={ankle_effector.clamped}, length_error={_chain_length_error(document.skeleton, document.solver_rig):.6f}"
+    )
+    return CheckResult("knee bend plane rule", passed, details)
+
+
 def _run_terminal_orientation_retarget_check() -> CheckResult:
     context = _fresh_context()
     document = context.document
@@ -945,6 +1282,170 @@ def _run_terminal_orientation_retarget_check() -> CheckResult:
         f"ball_angle={ball_angle:.2f}, wrist_drift={wrist_drift:.3f}"
     )
     return CheckResult("terminal orientation retarget", passed, details)
+
+
+def _run_wrist_forearm_rule_check() -> CheckResult:
+    context = _fresh_context()
+    document = context.document
+    hand_controller = _controller(document, "hand_r_additional")
+    hand_bone = _bone_from_skeleton(document.skeleton, "hand_r")
+    lowerarm_bone = _bone_from_skeleton(document.skeleton, "lowerarm_r")
+    default_length = max(distance(hand_controller.target.default_position, hand_bone.rest_world_position), 12.0)
+    rest_vector = scale(normalize(rotate_vector(hand_bone.rest_world_rotation, (0.0, 0.0, 1.0))), default_length)
+    forearm_axis = normalize(subtract(hand_bone.rest_world_position, lowerarm_bone.rest_world_position))
+    rotated_vector = rotate_vector(quaternion_angle_axis(math.radians(165.0), forearm_axis), rest_vector)
+    target = add(hand_bone.rest_world_position, rotated_vector)
+    context.service.move_controller(document.autoposing, "hand_r_additional", target)
+    _solve_context(context)
+
+    forearm_result = context.retargeter.last_joint_rule_results.get("forearm_r")
+    wrist_result = context.retargeter.last_joint_rule_results.get("wrist_r")
+    lower_twist = _retarget_joint(document.retarget_pose, "lowerarm_twist_01_r")
+    lower_twist_rest = _bone_from_skeleton(document.skeleton, "lowerarm_twist_01_r")
+    hand_pose = _retarget_joint(document.retarget_pose, "hand_r")
+    hand_rest = _bone_from_skeleton(document.skeleton, "hand_r")
+    lower_twist_angle = _quaternion_angle_degrees(lower_twist.local_rotation, lower_twist_rest.rest_local_rotation)
+    hand_angle = _quaternion_angle_degrees(hand_pose.local_rotation, hand_rest.rest_local_rotation)
+    forearm_applied = 0.0 if forearm_result is None else abs(forearm_result.debug_angles.get("forearm_applied_degrees", 0.0))
+    wrist_axial = 999.0 if wrist_result is None else abs(wrist_result.debug_angles.get("wrist_axial_degrees", 999.0))
+    wrist_requested = 0.0 if wrist_result is None else abs(wrist_result.debug_angles.get("wrist_axial_requested_degrees", 0.0))
+    passed = (
+        forearm_result is not None
+        and wrist_result is not None
+        and forearm_applied > 20.0
+        and lower_twist_angle > 1.0
+        and wrist_axial <= 15.5
+        and wrist_requested > wrist_axial + 5.0
+        and hand_angle < forearm_applied + wrist_requested + 5.0
+    )
+    details = (
+        f"forearm_applied={forearm_applied:.2f}, lower_twist={lower_twist_angle:.2f}, "
+        f"wrist_axial={wrist_axial:.2f}, wrist_requested={wrist_requested:.2f}, hand_angle={hand_angle:.2f}, "
+        f"wrist_state={'n/a' if wrist_result is None else wrist_result.pressure_state}"
+    )
+    return CheckResult("wrist forearm rule", passed, details)
+
+
+def _run_ankle_rule_check() -> CheckResult:
+    axis = (0.0, 0.0, 1.0)
+    flex_axis = (1.0, 0.0, 0.0)
+    rule = AnkleRule()
+    dorsiflexion = rule.solve(quaternion_angle_axis(math.radians(45.0), flex_axis), axis, flex_axis)
+    plantarflexion = rule.solve(quaternion_angle_axis(math.radians(80.0), (-1.0, 0.0, 0.0)), axis, flex_axis)
+    axial_twist = rule.solve(quaternion_angle_axis(math.radians(35.0), axis), axis, flex_axis)
+    direct_ok = (
+        dorsiflexion.pressure_state == "stretch"
+        and dorsiflexion.debug_angles["ankle_dorsiflexion_degrees"] <= 20.5
+        and plantarflexion.pressure_state == "stretch"
+        and plantarflexion.debug_angles["ankle_plantarflexion_degrees"] <= 55.5
+        and axial_twist.pressure_state == "stretch"
+        and abs(axial_twist.debug_angles["ankle_axial_twist_degrees"]) <= 12.5
+    )
+
+    context = _fresh_context()
+    document = context.document
+    initial_solved = context.service.solve_pose(document.autoposing, document.skeleton)
+    initial_foot = _joint_from_rig(initial_solved.rig, "foot_l").world_position
+    foot = _controller(document, "foot_l_secondary")
+    start = foot.target.world_position
+    context.service.move_controller(document.autoposing, "foot_l_secondary", (start[0] + 18.0, start[1] + 45.0, start[2] + 55.0))
+    _solve_context(context)
+    ankle_result = context.retargeter.last_joint_rule_results.get("ankle_l")
+    foot_pose = _retarget_joint(document.retarget_pose, "foot_l")
+    foot_rest = _bone_from_skeleton(document.skeleton, "foot_l")
+    foot_angle = _quaternion_angle_degrees(foot_pose.local_rotation, foot_rest.rest_local_rotation)
+    foot_drift = distance(initial_foot, _joint_from_rig(document.solver_rig, "foot_l").world_position)
+    integrated_ok = (
+        ankle_result is not None
+        and foot_angle > 0.5
+        and foot_drift < 0.001
+        and ankle_result.debug_angles["ankle_dorsiflexion_degrees"] <= 20.5
+        and ankle_result.debug_angles["ankle_plantarflexion_degrees"] <= 55.5
+    )
+
+    inactive_context = _fresh_context()
+    _solve_context(inactive_context)
+    inactive_ok = "ankle_l" not in inactive_context.retargeter.last_joint_rule_results
+
+    passed = direct_ok and integrated_ok and inactive_ok
+    details = (
+        f"dorsi={dorsiflexion.debug_angles['ankle_dorsiflexion_degrees']:.2f}, "
+        f"plantar={plantarflexion.debug_angles['ankle_plantarflexion_degrees']:.2f}, "
+        f"twist={axial_twist.debug_angles['ankle_axial_twist_degrees']:.2f}, "
+        f"foot_angle={foot_angle:.2f}, foot_drift={foot_drift:.6f}, inactive_ok={inactive_ok}"
+    )
+    return CheckResult("ankle rule", passed, details)
+
+
+def _run_foot_roll_rule_check() -> CheckResult:
+    rule = FootRollRule()
+    foot_axis = (0.0, 0.0, 1.0)
+    inversion = rule.solve_hindfoot_roll(quaternion_angle_axis(math.radians(55.0), foot_axis), foot_axis)
+    eversion = rule.solve_hindfoot_roll(quaternion_angle_axis(math.radians(45.0), (0.0, 0.0, -1.0)), foot_axis)
+    toe = rule.solve_toe_roll(quaternion_angle_axis(math.radians(80.0), (1.0, 0.0, 0.0)), (1.0, 0.0, 0.0))
+    direct_ok = (
+        inversion.pressure_state == "stretch"
+        and inversion.debug_angles["foot_inversion_degrees"] <= 30.5
+        and eversion.pressure_state == "stretch"
+        and eversion.debug_angles["foot_eversion_degrees"] <= 20.5
+        and toe.pressure_state == "stretch"
+        and abs(toe.debug_angles["toe_roll_applied_degrees"]) <= 30.5
+    )
+
+    context = _fresh_context()
+    document = context.document
+    anatomy = build_humanoid_anatomy_profile(document.skeleton)
+    initial_solved = context.service.solve_pose(document.autoposing, document.skeleton)
+    initial_foot = _joint_from_rig(initial_solved.rig, "foot_l").world_position
+    foot_additional = _controller(document, "foot_l_additional")
+    additional_start = foot_additional.target.world_position
+    context.service.move_controller(
+        document.autoposing,
+        "foot_l_additional",
+        (additional_start[0] + 42.0, additional_start[1] + 24.0, additional_start[2] + 32.0),
+    )
+    _solve_context(context)
+    foot_result = context.retargeter.last_joint_rule_results.get("foot_l")
+    foot_angle = _quaternion_angle_degrees(
+        _retarget_joint(document.retarget_pose, "foot_l").local_rotation,
+        _bone_from_skeleton(document.skeleton, "foot_l").rest_local_rotation,
+    )
+    foot_drift = distance(initial_foot, _joint_from_rig(document.solver_rig, "foot_l").world_position)
+    ball_y = _joint_from_rig(document.solver_rig, "ball_l").world_position[1]
+    additional_ok = foot_result is not None and foot_angle > 0.5 and foot_drift < 0.001 and ball_y >= anatomy.floor_y
+
+    ball_context = _fresh_context()
+    ball_document = ball_context.document
+    ball = _controller(ball_document, "ball_l_lesser")
+    ball_start = ball.target.world_position
+    ball_context.service.move_controller(
+        ball_document.autoposing,
+        "ball_l_lesser",
+        (ball_start[0] + 90.0, ball_start[1] + 25.0, ball_start[2] + 80.0),
+    )
+    _solve_context(ball_context)
+    ball_result = ball_context.retargeter.last_joint_rule_results.get("ball_l")
+    ball_effector = _effector(ball_document.solved_pose, "ball_l_lesser")
+    ball_angle = _quaternion_angle_degrees(
+        _retarget_joint(ball_document.retarget_pose, "ball_l").local_rotation,
+        _bone_from_skeleton(ball_document.skeleton, "ball_l").rest_local_rotation,
+    )
+    ball_ok = (
+        ball_result is not None
+        and ball_effector.clamped
+        and abs(ball_result.debug_angles["toe_roll_applied_degrees"]) <= 30.5
+        and ball_angle > 0.5
+    )
+
+    passed = direct_ok and additional_ok and ball_ok
+    details = (
+        f"inv={inversion.debug_angles['foot_inversion_degrees']:.2f}, "
+        f"ev={eversion.debug_angles['foot_eversion_degrees']:.2f}, "
+        f"toe={toe.debug_angles['toe_roll_applied_degrees']:.2f}, "
+        f"foot_angle={foot_angle:.2f}, foot_drift={foot_drift:.6f}, ball_y={ball_y:.3f}, "
+        f"ball_angle={ball_angle:.2f}, ball_clamped={ball_effector.clamped}"
+    )
+    return CheckResult("foot roll rule", passed, details)
 
 
 def _run_body_orientation_hint_check() -> CheckResult:
@@ -1340,13 +1841,20 @@ def main() -> int:
         _run_pose_prior_anatomy_check(),
         _run_support_rule_check(),
         _run_shoulder_girdle_check(),
+        _run_shoulder_girdle_rule_check(),
         _run_support_stability_check(),
+        _run_hip_pelvis_compensation_rule_check(),
         _run_visual_policy_check(),
         _run_controller_schema_topology_check(),
         _run_schema_layout_offset_check(),
         _run_semantic_constraint_extraction_check(),
         _run_bend_hint_semantics_check(),
+        _run_elbow_bend_plane_rule_check(),
+        _run_knee_bend_plane_rule_check(),
         _run_terminal_orientation_retarget_check(),
+        _run_wrist_forearm_rule_check(),
+        _run_ankle_rule_check(),
+        _run_foot_roll_rule_check(),
         _run_body_orientation_hint_check(),
         _run_direction_rods_check(),
         _run_controller_menu_state_check(),

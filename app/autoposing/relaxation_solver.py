@@ -11,8 +11,10 @@ from .body_compensation import apply_capped_compensation
 from .constraints import PoseConstraintSet
 from .finger_profile import FingerAnatomyProfile, build_finger_anatomy_profile, is_finger_controller_id
 from .finger_solver import FingerPoseSolver, SolvedFingerChain
+from .joint_rules.foot import FootRollRule
+from .joint_rules.hip import HipOverreachSource, HipPelvisRule
 from .limb_solver import LimbSolver, SolvedLimb
-from .reach_constraints import ReachConstraintResult, clamp_target_to_reach
+from .reach_constraints import ReachConstraintResult
 from .shoulder_solver import ShoulderGirdleResult, ShoulderGirdleSolver
 from .spine_solver import SpineSolver
 from .support_solver import SupportSolver
@@ -26,6 +28,8 @@ class WholeBodyRelaxationSolver:
         self._finger_solver = FingerPoseSolver()
         self._shoulder_solver = ShoulderGirdleSolver()
         self._balance_solver = SupportBalanceSolver()
+        self._hip_rule = HipPelvisRule()
+        self._foot_rule = FootRollRule()
 
     def solve(
         self,
@@ -75,14 +79,14 @@ class WholeBodyRelaxationSolver:
             constraints,
             max_length=anatomy.body_height * 0.12,
         )
-        leg_compensation = self._intent_weighted_overreach(
-            (
-                ("ankle_l_main", limbs["left_leg"], 0.65),
-                ("ankle_r_main", limbs["right_leg"], 0.65),
+        leg_compensation = self._hip_rule.solve_leg_overreach(
+            sources=(
+                HipOverreachSource("ankle_l_main", limbs["left_leg"].reach.overreach_vector, 0.72),
+                HipOverreachSource("ankle_r_main", limbs["right_leg"].reach.overreach_vector, 0.72),
             ),
-            constraints,
-            max_length=anatomy.body_height * (0.08 if stable_support_count == 1 else 0.18),
-            vertical_weight=0.12 if stable_support_count == 1 else 1.0,
+            constraints=constraints,
+            stable_support_count=stable_support_count,
+            body_height=anatomy.body_height,
         )
         pelvis, chest_target, head_target = apply_capped_compensation(
             pelvis,
@@ -100,10 +104,10 @@ class WholeBodyRelaxationSolver:
             pelvis,
             chest_target,
             head_target,
-            leg_compensation,
-            pelvis_weight=0.38 if stable_support_count == 1 else 0.62,
-            chest_weight=0.12 if stable_support_count == 1 else 0.18,
-            head_weight=0.06,
+            leg_compensation.compensation,
+            pelvis_weight=leg_compensation.pelvis_weight,
+            chest_weight=leg_compensation.chest_weight,
+            head_weight=leg_compensation.head_weight,
             pelvis_locked=constraints.locked("pelvis_main"),
             chest_locked=constraints.locked("chest_secondary"),
             head_locked=constraints.locked("head_main"),
@@ -224,8 +228,18 @@ class WholeBodyRelaxationSolver:
         clavicle_r = self._clavicle_position(anatomy, shoulder_result, "r", spine_positions.get("spine_05", chest_target))
         upperarm_l_start = anatomy.offset("clavicle_l", "upperarm_l", clavicle_l)
         upperarm_r_start = anatomy.offset("clavicle_r", "upperarm_r", clavicle_r)
-        thigh_l_start = anatomy.offset("pelvis", "thigh_l", pelvis)
-        thigh_r_start = anatomy.offset("pelvis", "thigh_r", pelvis)
+        thigh_l_start = self._hip_rule.chain_start_for_side(
+            anatomy=anatomy,
+            constraints=constraints,
+            pelvis_position=pelvis,
+            side="l",
+        )
+        thigh_r_start = self._hip_rule.chain_start_for_side(
+            anatomy=anatomy,
+            constraints=constraints,
+            pelvis_position=pelvis,
+            side="r",
+        )
 
         left_arm_chain = anatomy.limb_chains["left_arm"]
         right_arm_chain = anatomy.limb_chains["right_arm"]
@@ -332,8 +346,13 @@ class WholeBodyRelaxationSolver:
         if constraint is None:
             return default_ball
         max_reach = max(anatomy.length(f"foot_{side}", ball_name) * 1.15, 0.001)
-        reach = clamp_target_to_reach(foot_position, constraint.target_world_position, max_reach)
-        return self._support_solver.clamp_to_floor(reach.clamped_target, anatomy.floor_y)
+        result = self._foot_rule.solve_ball_position(
+            foot_position=foot_position,
+            target_position=constraint.target_world_position,
+            floor_y=anatomy.floor_y,
+            max_reach=max_reach,
+        )
+        return result.solved_position
 
     def _limb_pressure(self, limbs: dict[str, SolvedLimb]) -> dict[str, ReachConstraintResult]:
         left_arm = limbs["left_arm"]
@@ -436,6 +455,14 @@ class WholeBodyRelaxationSolver:
                 clamped_position = limb.reach.clamped_target if controller.controller_type == "main" else solved_position
                 pressure = limb.reach.pressure
                 pressure_state = limb.reach.pressure_state
+                if controller.identifier.startswith("elbow_") and limb.elbow_rule is not None:
+                    pressure = max(pressure, limb.elbow_rule.pressure)
+                    if "stretch" in {pressure_state, limb.elbow_rule.pressure_state}:
+                        pressure_state = "stretch"
+                if controller.identifier.startswith("knee_") and limb.knee_rule is not None:
+                    pressure = max(pressure, limb.knee_rule.pressure)
+                    if "stretch" in {pressure_state, limb.knee_rule.pressure_state}:
+                        pressure_state = "stretch"
                 clamped = (
                     constraints.engaged(controller.identifier)
                     and limb.reach.clamped
@@ -521,7 +548,12 @@ class WholeBodyRelaxationSolver:
         ball_name = f"ball_{side}"
         foot_position = solved_positions.get(foot_name, anatomy.rest(foot_name))
         max_reach = max(anatomy.length(foot_name, ball_name) * 1.15, 0.001)
-        return clamp_target_to_reach(foot_position, target_position, max_reach)
+        return self._foot_rule.solve_ball_position(
+            foot_position=foot_position,
+            target_position=target_position,
+            floor_y=anatomy.floor_y,
+            max_reach=max_reach,
+        ).reach
 
     @staticmethod
     def _finger_result_for_controller(

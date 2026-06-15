@@ -5,6 +5,7 @@ from core.math import (
     distance,
     extract_twist_rotation,
     inverse_quaternion,
+    length,
     normalize,
     normalize_quaternion,
     project_on_plane,
@@ -19,6 +20,7 @@ from core.math import (
 from core.skeleton.models import BoneModel, SkeletonModel, Vec3
 
 from .finger_profile import build_finger_anatomy_profile
+from .joint_rules import AnkleRule, FootRollRule, ForearmRule, JointRuleResult, WristRule
 
 
 class RuntimeRetargeter:
@@ -82,7 +84,15 @@ class RuntimeRetargeter:
         "calf_r": ("foot_r", ("calf_twist_01_r", "calf_twist_02_r")),
     }
 
+    def __init__(self) -> None:
+        self._forearm_rule = ForearmRule()
+        self._wrist_rule = WristRule()
+        self._ankle_rule = AnkleRule()
+        self._foot_rule = FootRollRule()
+        self.last_joint_rule_results: dict[str, JointRuleResult] = {}
+
     def retarget(self, rig: AutoPosingRigModel, solved_pose: SolvedPoseModel, skeleton: SkeletonModel) -> RetargetPoseModel:
+        self.last_joint_rule_results = {}
         rest_by_name = {bone.name: bone for bone in skeleton.bones}
         solved_by_name = {joint.name: joint for joint in solved_pose.rig.joints}
         controllers_by_id = {controller.identifier: controller for controller in rig.controllers}
@@ -122,6 +132,23 @@ class RuntimeRetargeter:
                 local_rotation=normalize_quaternion(local_rotation),
                 world_position=world_position,
             )
+
+        self._apply_wrist_forearm_rules(
+            rest_by_name,
+            solved_by_name,
+            controllers_by_id,
+            effectors_by_id,
+            desired_world_rotations,
+            pose_map,
+        )
+        self._apply_ankle_foot_rules(
+            rest_by_name,
+            solved_by_name,
+            controllers_by_id,
+            effectors_by_id,
+            desired_world_rotations,
+            pose_map,
+        )
 
         for parent_name, (_, twist_names) in self._TWIST_GROUPS.items():
             parent_bone = rest_by_name.get(parent_name)
@@ -170,7 +197,18 @@ class RuntimeRetargeter:
                 if current_hint != (0.0, 0.0, 0.0) and desired_hint != (0.0, 0.0, 0.0):
                     desired_world_rotation = normalize_quaternion(
                         quaternion_multiply(rotation_between_vectors(current_hint, desired_hint), desired_world_rotation)
+                    )
+                parent_rotation = self._parent_world_rotation(ball_bone, desired_world_rotations, rest_by_name)
+                ball_delta = self._local_delta_from_world(ball_bone, parent_rotation, desired_world_rotation)
+                toe_axis = self._foot_flexion_axis(ball_bone)
+                ball_result = self._foot_rule.solve_toe_roll(ball_delta, toe_axis)
+                desired_world_rotation = normalize_quaternion(
+                    quaternion_multiply(
+                        parent_rotation,
+                        quaternion_multiply(ball_result.rotation, ball_bone.rest_local_rotation),
+                    )
                 )
+                self.last_joint_rule_results[ball_name] = ball_result
             desired_world_rotations[ball_name] = desired_world_rotation
             parent_rotation = self._parent_world_rotation(ball_bone, desired_world_rotations, rest_by_name)
             pose_map[ball_name] = RetargetJointPoseModel(
@@ -254,23 +292,9 @@ class RuntimeRetargeter:
         if bone.name not in solved_by_name:
             return None
         if bone.name == "hand_l":
-            hand_rotation = self._terminal_rotation_from_controller(
-                bone,
-                solved_by_name,
-                controllers_by_id,
-                effectors_by_id,
-                ("hand_l_additional", "hand_l_secondary"),
-            )
-            return self._blend_finger_palm_spread(bone, "l", hand_rotation, controllers_by_id, effectors_by_id)
+            return None
         if bone.name == "hand_r":
-            hand_rotation = self._terminal_rotation_from_controller(
-                bone,
-                solved_by_name,
-                controllers_by_id,
-                effectors_by_id,
-                ("hand_r_additional", "hand_r_secondary"),
-            )
-            return self._blend_finger_palm_spread(bone, "r", hand_rotation, controllers_by_id, effectors_by_id)
+            return None
         if bone.name == "head":
             return self._terminal_rotation_from_controller(
                 bone,
@@ -280,6 +304,71 @@ class RuntimeRetargeter:
                 ("head_additional",),
             )
         return None
+
+    def _apply_wrist_forearm_rules(
+        self,
+        rest_by_name: dict[str, BoneModel],
+        solved_by_name: dict[str, object],
+        controllers_by_id: dict[str, object],
+        effectors_by_id: dict[str, object],
+        desired_world_rotations: dict[str, tuple[float, float, float, float]],
+        pose_map: dict[str, RetargetJointPoseModel],
+    ) -> None:
+        for side in ("l", "r"):
+            hand_name = f"hand_{side}"
+            lowerarm_name = f"lowerarm_{side}"
+            hand_bone = rest_by_name.get(hand_name)
+            lowerarm_bone = rest_by_name.get(lowerarm_name)
+            lowerarm_pose = pose_map.get(lowerarm_name)
+            if hand_bone is None or lowerarm_bone is None or lowerarm_pose is None:
+                continue
+
+            desired_hand_world = self._terminal_rotation_from_controller(
+                hand_bone,
+                solved_by_name,
+                controllers_by_id,
+                effectors_by_id,
+                (f"hand_{side}_additional", f"hand_{side}_secondary"),
+            )
+            desired_hand_world = self._blend_finger_palm_spread(
+                hand_bone,
+                side,
+                desired_hand_world,
+                controllers_by_id,
+                effectors_by_id,
+            )
+            if desired_hand_world is None:
+                continue
+
+            parent_world = self._parent_world_rotation(lowerarm_bone, desired_world_rotations, rest_by_name)
+            lowerarm_world = desired_world_rotations.get(lowerarm_name, lowerarm_bone.rest_world_rotation)
+            desired_hand_local = quaternion_multiply(inverse_quaternion(lowerarm_world), desired_hand_world)
+            hand_local_delta = quaternion_multiply(desired_hand_local, inverse_quaternion(hand_bone.rest_local_rotation))
+
+            forearm_result = self._forearm_rule.solve(hand_local_delta, lowerarm_bone.primary_axis)
+            wrist_result = self._wrist_rule.solve(hand_local_delta, lowerarm_bone.primary_axis, forearm_result.overflow_twist)
+
+            lowerarm_local = normalize_quaternion(
+                quaternion_multiply(forearm_result.rotation, lowerarm_pose.local_rotation)
+            )
+            lowerarm_world = normalize_quaternion(quaternion_multiply(parent_world, lowerarm_local))
+            desired_world_rotations[lowerarm_name] = lowerarm_world
+            pose_map[lowerarm_name] = RetargetJointPoseModel(
+                name=lowerarm_name,
+                local_position=lowerarm_bone.rest_local_position,
+                local_rotation=lowerarm_local,
+            )
+
+            hand_local = normalize_quaternion(quaternion_multiply(wrist_result.rotation, hand_bone.rest_local_rotation))
+            hand_world = normalize_quaternion(quaternion_multiply(lowerarm_world, hand_local))
+            desired_world_rotations[hand_name] = hand_world
+            pose_map[hand_name] = RetargetJointPoseModel(
+                name=hand_name,
+                local_position=hand_bone.rest_local_position,
+                local_rotation=hand_local,
+            )
+            self.last_joint_rule_results[f"forearm_{side}"] = forearm_result
+            self.last_joint_rule_results[f"wrist_{side}"] = wrist_result
 
     def _blend_finger_palm_spread(
         self,
@@ -314,6 +403,76 @@ class RuntimeRetargeter:
         weight = 0.05 if base_rotation is not None else 0.2
         weighted_delta = quaternion_slerp((1.0, 0.0, 0.0, 0.0), spread_delta, weight)
         return normalize_quaternion(quaternion_multiply(weighted_delta, base))
+
+    def _apply_ankle_foot_rules(
+        self,
+        rest_by_name: dict[str, BoneModel],
+        solved_by_name: dict[str, object],
+        controllers_by_id: dict[str, object],
+        effectors_by_id: dict[str, object],
+        desired_world_rotations: dict[str, tuple[float, float, float, float]],
+        pose_map: dict[str, RetargetJointPoseModel],
+    ) -> None:
+        for side in ("l", "r"):
+            foot_name = f"foot_{side}"
+            foot_bone = rest_by_name.get(foot_name)
+            foot_pose = pose_map.get(foot_name)
+            if foot_bone is None or foot_pose is None or foot_name not in solved_by_name:
+                continue
+
+            flex_controller = controllers_by_id.get(f"foot_{side}_secondary")
+            roll_controller = controllers_by_id.get(f"foot_{side}_additional")
+            ball_controller = controllers_by_id.get(f"ball_{side}_lesser")
+            flex_engaged = self._controller_engaged(flex_controller)
+            roll_engaged = self._controller_engaged(roll_controller) or self._controller_engaged(ball_controller)
+            if not flex_engaged and not roll_engaged:
+                continue
+
+            parent_world = self._parent_world_rotation(foot_bone, desired_world_rotations, rest_by_name)
+            base_world = desired_world_rotations.get(foot_name, foot_bone.rest_world_rotation)
+            desired_flex_world = base_world
+            if flex_engaged:
+                desired_flex_world = (
+                    self._terminal_rotation_from_controller(
+                        foot_bone,
+                        solved_by_name,
+                        controllers_by_id,
+                        effectors_by_id,
+                        (f"foot_{side}_secondary",),
+                    )
+                    or base_world
+                )
+            flex_delta = self._local_delta_from_world(foot_bone, parent_world, desired_flex_world)
+            flexion_axis = self._foot_flexion_axis(foot_bone)
+            ankle_result = self._ankle_rule.solve(flex_delta, foot_bone.primary_axis, flexion_axis)
+
+            roll_rotation = (1.0, 0.0, 0.0, 0.0)
+            if roll_engaged:
+                desired_roll_world = (
+                    self._terminal_rotation_from_controller(
+                        foot_bone,
+                        solved_by_name,
+                        controllers_by_id,
+                        effectors_by_id,
+                        (f"foot_{side}_additional", f"ball_{side}_lesser"),
+                    )
+                    or base_world
+                )
+                roll_delta = self._local_delta_from_world(foot_bone, parent_world, desired_roll_world)
+                foot_result = self._foot_rule.solve_hindfoot_roll(roll_delta, foot_bone.primary_axis)
+                roll_rotation = foot_result.rotation
+                self.last_joint_rule_results[f"foot_{side}"] = foot_result
+
+            local_delta = normalize_quaternion(quaternion_multiply(roll_rotation, ankle_result.rotation))
+            local_rotation = normalize_quaternion(quaternion_multiply(local_delta, foot_bone.rest_local_rotation))
+            desired_world = normalize_quaternion(quaternion_multiply(parent_world, local_rotation))
+            desired_world_rotations[foot_name] = desired_world
+            pose_map[foot_name] = RetargetJointPoseModel(
+                name=foot_name,
+                local_position=foot_bone.rest_local_position,
+                local_rotation=local_rotation,
+            )
+            self.last_joint_rule_results[f"ankle_{side}"] = ankle_result
 
     def _ball_controller_roll_hint(
         self,
@@ -531,26 +690,6 @@ class RuntimeRetargeter:
             hint = effectors_by_id.get("knee_l_secondary" if bone_name.endswith("_l") else "knee_r_secondary")
             if hint is not None:
                 return subtract(hint.solved_world_position, solved_by_name[bone_name].world_position)
-        if bone_name == "foot_l":
-            foot_hint = self._engaged_effector_vector(
-                ("foot_l_additional", "foot_l_secondary", "ball_l_lesser"),
-                bone_name,
-                solved_by_name,
-                controllers_by_id,
-                effectors_by_id,
-            )
-            if foot_hint is not None:
-                return foot_hint
-        if bone_name == "foot_r":
-            foot_hint = self._engaged_effector_vector(
-                ("foot_r_additional", "foot_r_secondary", "ball_r_lesser"),
-                bone_name,
-                solved_by_name,
-                controllers_by_id,
-                effectors_by_id,
-            )
-            if foot_hint is not None:
-                return foot_hint
         return normalize(rotate_vector(rest_by_name[bone_name].rest_world_rotation, (0.0, 0.0, 1.0)))
 
     def _engaged_effector_vector(
@@ -589,6 +728,18 @@ class RuntimeRetargeter:
             return normalize(rotate_vector(fallback_rotation, (0.0, 0.0, 1.0)))
         vector = subtract(right.world_position, left.world_position)
         return normalize(vector) if vector != (0.0, 0.0, 0.0) else normalize(rotate_vector(fallback_rotation, (0.0, 0.0, 1.0)))
+
+    def _local_delta_from_world(self, bone: BoneModel, parent_world_rotation, desired_world_rotation):
+        local_rotation = normalize_quaternion(quaternion_multiply(inverse_quaternion(parent_world_rotation), desired_world_rotation))
+        return normalize_quaternion(quaternion_multiply(local_rotation, inverse_quaternion(bone.rest_local_rotation)))
+
+    @staticmethod
+    def _foot_flexion_axis(bone: BoneModel) -> Vec3:
+        axis = normalize(project_on_plane((1.0, 0.0, 0.0), bone.primary_axis))
+        if length(axis) > 1e-6:
+            return axis
+        axis = normalize(project_on_plane((0.0, 1.0, 0.0), bone.primary_axis))
+        return axis if length(axis) > 1e-6 else (1.0, 0.0, 0.0)
 
     def _parent_world_rotation(
         self,

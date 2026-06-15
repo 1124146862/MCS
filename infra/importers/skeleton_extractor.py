@@ -3,6 +3,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from core.math import length, normalize
 from core.skeleton.models import BoneModel, SkeletonModel
 
 
@@ -166,7 +167,10 @@ def _normalize_quaternion(quaternion: tuple[float, float, float, float]) -> tupl
 
 def _build_skeleton_from_nodes(joint_ids: list[str], root_nodes: list[_ParsedNode]) -> SkeletonModel:
     joint_set = set(joint_ids)
+    local_positions: dict[str, tuple[float, float, float]] = {}
+    local_rotations: dict[str, tuple[float, float, float, float]] = {}
     world_positions: dict[str, tuple[float, float, float]] = {}
+    world_rotations: dict[str, tuple[float, float, float, float]] = {}
     ancestry: dict[str, str | None] = {}
     object_names: dict[str, str] = {}
 
@@ -187,7 +191,10 @@ def _build_skeleton_from_nodes(joint_ids: list[str], root_nodes: list[_ParsedNod
 
             ancestry[node.node_id] = nearest_joint_parent
             if node.node_id in joint_set:
+                local_positions[node.node_id] = node.position
+                local_rotations[node.node_id] = node.rotation
                 world_positions[node.node_id] = current_position
+                world_rotations[node.node_id] = current_rotation
                 object_names[node.node_id] = node.object_name or node.node_id
             current_parent_id = node.node_id
 
@@ -213,11 +220,27 @@ def _build_skeleton_from_nodes(joint_ids: list[str], root_nodes: list[_ParsedNod
         if parent_name in _HIDDEN_JOINT_NAMES:
             parent_name = None
 
+        local_position = local_positions.get(joint_id, (0.0, 0.0, 0.0))
+        local_rotation = local_rotations.get(joint_id, (1.0, 0.0, 0.0, 0.0))
+        world_position = world_positions[joint_id]
+        world_rotation = world_rotations.get(joint_id, (1.0, 0.0, 0.0, 0.0))
+        bone_length = length(local_position)
+        primary_axis = normalize(local_position) if bone_length > 1e-6 else (1.0, 0.0, 0.0)
+
         bones.append(
             BoneModel(
                 name=object_name,
                 parent_name=parent_name,
+                local_position=local_position,
+                local_rotation=local_rotation,
                 world_position=world_position,
+                world_rotation=world_rotation,
+                rest_local_position=local_position,
+                rest_local_rotation=local_rotation,
+                rest_world_position=world_position,
+                rest_world_rotation=world_rotation,
+                bone_length=bone_length,
+                primary_axis=primary_axis,
             )
         )
 

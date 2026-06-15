@@ -1,5 +1,20 @@
 from dataclasses import dataclass, field
 
+from core.rig.models import RigModel
+from core.skeleton.models import Quat, Vec3
+
+
+@dataclass(slots=True)
+class ControllerTargetModel:
+    controller_id: str
+    world_position: Vec3
+    default_position: Vec3
+    solved_world_position: Vec3 = (0.0, 0.0, 0.0)
+    clamped_world_position: Vec3 = (0.0, 0.0, 0.0)
+    pressure: float = 0.0
+    pressure_state: str = "normal"
+    clamped: bool = False
+
 
 @dataclass(slots=True)
 class AutoPosingControllerModel:
@@ -7,13 +22,45 @@ class AutoPosingControllerModel:
     name: str
     controller_type: str
     joint_name: str
-    world_position: tuple[float, float, float]
-    default_position: tuple[float, float, float]
+    target: ControllerTargetModel
     visible: bool = True
     active: bool = False
     fixed: bool = False
     always_active: bool = False
     selected: bool = False
+
+
+@dataclass(slots=True)
+class SolvedEffectorModel:
+    controller_id: str
+    joint_name: str
+    target_world_position: Vec3
+    solved_world_position: Vec3
+    clamped_world_position: Vec3
+    pressure: float = 0.0
+    pressure_state: str = "normal"
+    clamped: bool = False
+
+
+@dataclass(slots=True)
+class SolvedPoseModel:
+    rig: RigModel = field(default_factory=RigModel)
+    effectors: list[SolvedEffectorModel] = field(default_factory=list)
+    status_message: str = ""
+
+
+@dataclass(slots=True)
+class RetargetJointPoseModel:
+    name: str
+    local_position: Vec3
+    local_rotation: Quat
+    world_position: Vec3 | None = None
+
+
+@dataclass(slots=True)
+class RetargetPoseModel:
+    joints: list[RetargetJointPoseModel] = field(default_factory=list)
+    status_message: str = ""
 
 
 @dataclass(slots=True)

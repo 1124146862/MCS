@@ -239,9 +239,20 @@ Item {
                     }
 
                     Loader3D {
+                        id: runtimeModelLoader
                         visible: root.importedModelReady
                         source: root.documentViewModel ? root.documentViewModel.generatedComponentUrl : ""
                         scale: Qt.vector3d(1, 1, 1)
+
+                        onItemChanged: {
+                            if (!root.documentViewModel)
+                                return
+
+                            if (item)
+                                root.documentViewModel.bindRuntimeModel(item)
+                            else
+                                root.documentViewModel.clearRuntimeModel()
+                        }
                     }
 
                     Node {
@@ -369,6 +380,7 @@ Item {
             }
 
             AutoPosingOverlay {
+                id: autoPosingOverlay
                 anchors.fill: sceneView
                 sceneView: sceneView
                 cameraOrbit: cameraOrbit

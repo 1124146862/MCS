@@ -1,3 +1,3 @@
-from .models import BoneModel, SkeletonModel
+from .models import BoneModel, Quat, SkeletonModel, Vec3
 
-__all__ = ["BoneModel", "SkeletonModel"]
+__all__ = ["BoneModel", "Quat", "SkeletonModel", "Vec3"]

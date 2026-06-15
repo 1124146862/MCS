@@ -14,7 +14,7 @@ Item {
     signal projectionClicked()
     signal lockClicked()
 
-    readonly property real orbitRadius: 28
+    readonly property real orbitRadius: 24
     readonly property vector3d xAxisVector: Qt.vector3d(1, 0, 0)
     readonly property vector3d yAxisVector: Qt.vector3d(0, 1, 0)
     readonly property vector3d zAxisVector: Qt.vector3d(0, 0, 1)
@@ -22,8 +22,9 @@ Item {
     readonly property color yAxisColor: "#8fbc38"
     readonly property color zAxisColor: "#4285f4"
 
-    width: 76
-    height: 76
+    // Increased root size to prevent labels from overflowing the bounding box
+    width: 90
+    height: 90
 
     function dot(a, b) {
         return a.x * b.x + a.y * b.y + a.z * b.z
@@ -45,8 +46,8 @@ Item {
                 : Qt.vector3d(-axis.x, -axis.y, -axis.z)
         const screenVector = root.axisScreenVector(direction)
         return Qt.point(
-            bezel.width / 2 + screenVector.x * root.orbitRadius,
-            bezel.height / 2 - screenVector.y * root.orbitRadius
+            bezel.x + bezel.width / 2 + screenVector.x * root.orbitRadius,
+            bezel.y + bezel.height / 2 - screenVector.y * root.orbitRadius
         )
     }
 
@@ -78,11 +79,11 @@ Item {
 
     function axisLabelPoint(axis) {
         const frontPoint = root.axisFrontPoint(axis)
-        const centerPoint = Qt.point(bezel.width / 2, bezel.height / 2)
+        const centerPoint = Qt.point(bezel.x + bezel.width / 2, bezel.y + bezel.height / 2)
         const deltaX = frontPoint.x - centerPoint.x
         const deltaY = frontPoint.y - centerPoint.y
         const length = Math.max(Math.sqrt(deltaX * deltaX + deltaY * deltaY), 0.001)
-        const offset = 14
+        const offset = 12
         return Qt.point(
             frontPoint.x + (deltaX / length) * offset,
             frontPoint.y + (deltaY / length) * offset
@@ -91,14 +92,16 @@ Item {
 
     Rectangle {
         id: bezel
-        anchors.fill: parent
-        radius: width / 2
-        color: "#282a2e"
-        opacity: 0.9
+        anchors.centerIn: parent
+        width: 68
+        height: 68
+        radius: 34
+        color: "#2b2d31"
+        opacity: 0.95
     }
 
     Item {
-        anchors.fill: bezel
+        anchors.fill: parent
 
         Item {
             x: root.axisPoint(root.xAxisVector, false).x
@@ -230,11 +233,23 @@ Item {
         }
     }
 
+    // Restored the center box as requested
+    Rectangle {
+        anchors.centerIn: bezel
+        width: 14
+        height: 14
+        radius: 2
+        color: root.orthographicView ? "#e2e5e9" : "#c4c8ce"
+        border.color: "#ffffff"
+        border.width: 1
+        opacity: 0.95
+    }
+
     Item {
-        anchors.fill: bezel
+        anchors.fill: parent
 
         Rectangle {
-            anchors.centerIn: parent
+            anchors.centerIn: bezel
             width: 24
             height: 24
             radius: 2
@@ -251,9 +266,9 @@ Item {
         Rectangle {
             x: root.axisLabelPoint(root.xAxisVector).x - width / 2
             y: root.axisLabelPoint(root.xAxisVector).y - height / 2
-            width: 20
-            height: 20
-            radius: 10
+            width: 18
+            height: 18
+            radius: 9
             color: root.xAxisColor
 
             Text {
@@ -275,9 +290,9 @@ Item {
         Rectangle {
             x: root.axisLabelPoint(root.yAxisVector).x - width / 2
             y: root.axisLabelPoint(root.yAxisVector).y - height / 2
-            width: 20
-            height: 20
-            radius: 10
+            width: 18
+            height: 18
+            radius: 9
             color: root.yAxisColor
 
             Text {
@@ -299,9 +314,9 @@ Item {
         Rectangle {
             x: root.axisLabelPoint(root.zAxisVector).x - width / 2
             y: root.axisLabelPoint(root.zAxisVector).y - height / 2
-            width: 20
-            height: 20
-            radius: 10
+            width: 18
+            height: 18
+            radius: 9
             color: root.zAxisColor
 
             Text {
@@ -324,12 +339,12 @@ Item {
     Image {
         anchors.right: parent.right
         anchors.bottom: parent.bottom
-        anchors.rightMargin: 0
-        anchors.bottomMargin: 0
+        anchors.rightMargin: 4
+        anchors.bottomMargin: 4
         source: root.navigationLocked ? "../../assets/lock.svg" : "../../assets/unlock.svg"
         sourceSize.width: 14
         sourceSize.height: 14
-        opacity: root.navigationLocked ? 0.9 : 0.3
+        opacity: root.navigationLocked ? 0.9 : 0.4
 
         MouseArea {
             anchors.fill: parent

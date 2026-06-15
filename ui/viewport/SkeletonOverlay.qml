@@ -91,7 +91,7 @@ Node {
                 materials: [
                     DefaultMaterial {
                         lighting: DefaultMaterial.NoLighting
-                        diffuseColor: "#1b6f3a"
+                        diffuseColor: modelData.color ? modelData.color : "#1b6f3a"
                     }
                 ]
             }
@@ -117,7 +117,7 @@ Node {
             materials: [
                 DefaultMaterial {
                     lighting: DefaultMaterial.NoLighting
-                    diffuseColor: "#17823d"
+                    diffuseColor: modelData.color ? modelData.color : "#17823d"
                 }
             ]
         }

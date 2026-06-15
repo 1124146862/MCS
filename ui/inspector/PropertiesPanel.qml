@@ -110,9 +110,42 @@ Rectangle {
                 }
 
                 RowLayout {
+                    visible: root.documentViewModel
+                             && root.documentViewModel.isAutoPosingMode
+                    spacing: 8
+
+                    Button {
+                        text: qsTr("Normal")
+                        checkable: true
+                        checked: root.documentViewModel && root.documentViewModel.autoPosingDisplayMode === "normal"
+                        onClicked: root.documentViewModel.setAutoPosingDisplayMode("normal")
+                    }
+
+                    Button {
+                        text: qsTr("Fingers")
+                        checkable: true
+                        enabled: root.documentViewModel && root.documentViewModel.hasAutoPosingFingers
+                        checked: root.documentViewModel && root.documentViewModel.autoPosingDisplayMode === "fingers"
+                        onClicked: root.documentViewModel.setAutoPosingDisplayMode("fingers")
+                    }
+
+                    Button {
+                        text: qsTr("Debug")
+                        checkable: true
+                        checked: root.documentViewModel && root.documentViewModel.autoPosingDisplayMode === "debug"
+                        onClicked: root.documentViewModel.setAutoPosingDisplayMode("debug")
+                    }
+                }
+
+                RowLayout {
                     visible: root.documentViewModel && root.documentViewModel.isAutoPosingMode
                               && root.documentViewModel.selectedAutoPosingControllerName !== ""
                     spacing: 8
+
+                    Button {
+                        text: qsTr("Lock / Unlock")
+                        onClicked: root.documentViewModel.toggleSelectedAutoPosingLock()
+                    }
 
                     Button {
                         text: qsTr("Fix / Unfix")
@@ -120,8 +153,8 @@ Rectangle {
                     }
 
                     Button {
-                        text: qsTr("Reset (Shift+Z)")
-                        onClicked: root.documentViewModel.resetSelectedAutoPosingController()
+                        text: qsTr("Unlock / Reset")
+                        onClicked: root.documentViewModel.unlockOrResetSelectedAutoPosingController()
                     }
                 }
             }

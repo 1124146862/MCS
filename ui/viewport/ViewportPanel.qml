@@ -343,7 +343,10 @@ Item {
                 anchors.fill: sceneView
                 enabled: false
                 camera: skeletonOverlayCamera
-                visible: root.jointMode || root.autoPosingMode
+                visible: root.jointMode
+                         || (root.autoPosingMode
+                             && root.documentViewModel
+                             && root.documentViewModel.isAutoPosingDebugVisible)
 
                 environment: SceneEnvironment {
                     backgroundMode: SceneEnvironment.Transparent
@@ -365,7 +368,10 @@ Item {
                 }
 
                 SkeletonOverlay {
-                    visible: root.jointMode || root.autoPosingMode
+                    visible: root.jointMode
+                             || (root.autoPosingMode
+                                 && root.documentViewModel
+                                 && root.documentViewModel.isAutoPosingDebugVisible)
                     joints: root.documentViewModel
                             ? (root.autoPosingMode
                                ? root.documentViewModel.autoPosingPreviewJoints

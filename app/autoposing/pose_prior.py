@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from core.math import add, scale, subtract
+from core.math import add, length, scale, subtract
 from core.rig.models import JointModel, RigModel
 from core.skeleton.models import BoneModel, SkeletonModel, Vec3
 
@@ -37,7 +37,7 @@ class PosePriorEstimator:
         )
 
         if not constraints.locked("pelvis_main"):
-            pelvis = self._apply_leg_average_offset(anatomy, left_ankle, right_ankle, pelvis)
+            pelvis = self._apply_leg_average_offset(anatomy, constraints, left_ankle, right_ankle, pelvis)
             pelvis = self._apply_wrist_posture_bias(anatomy, constraints, pelvis, weight=0.025)
             pelvis = self._support_solver.limit_pelvis_height(anatomy, pelvis)
         if not constraints.locked("chest_secondary"):
@@ -61,14 +61,37 @@ class PosePriorEstimator:
         ]
         return RigModel(name="AutoPosing PriorRig", joints=joints)
 
-    def _apply_leg_average_offset(self, anatomy: HumanoidAnatomyProfile, left_ankle: Vec3, right_ankle: Vec3, pelvis: Vec3) -> Vec3:
-        rest_feet = (anatomy.rest("foot_l"), anatomy.rest("foot_r"))
-        target_feet = (left_ankle, right_ankle)
+    def _apply_leg_average_offset(
+        self,
+        anatomy: HumanoidAnatomyProfile,
+        constraints: PoseConstraintSet,
+        left_ankle: Vec3,
+        right_ankle: Vec3,
+        pelvis: Vec3,
+    ) -> Vec3:
+        rest_feet = (("l", anatomy.rest("foot_l")), ("r", anatomy.rest("foot_r")))
+        target_feet = {"l": left_ankle, "r": right_ankle}
         delta = (0.0, 0.0, 0.0)
-        for rest_point, current_point in zip(rest_feet, target_feet, strict=True):
-            delta = add(delta, subtract(current_point, rest_point))
-        delta = scale(delta, 0.5)
-        return add(pelvis, scale(delta, 0.75))
+        total_weight = 0.0
+        stable_support = any(constraints.support_weight(f"ankle_{side}_main") >= 0.7 for side in ("l", "r"))
+        for side, rest_point in rest_feet:
+            controller_id = f"ankle_{side}_main"
+            intent_weight = constraints.pose_intent_weight(controller_id)
+            support_weight = constraints.support_weight(controller_id)
+            weight = max(0.0, intent_weight - support_weight * 0.5) if stable_support else max(intent_weight, support_weight * 0.5)
+            if weight <= 0.0:
+                continue
+            foot_delta = subtract(target_feet[side], rest_point)
+            if stable_support:
+                foot_delta = (foot_delta[0], foot_delta[1] * 0.12, foot_delta[2])
+            delta = add(delta, scale(foot_delta, weight))
+            total_weight += weight
+        if total_weight <= 0.0:
+            return pelvis
+        delta = scale(delta, 1.0 / total_weight)
+        factor = 0.12 if stable_support else 0.75
+        max_delta = max((anatomy.leg_length("l") + anatomy.leg_length("r")) * 0.5 * (0.10 if stable_support else 0.45), 0.001)
+        return add(pelvis, self._cap_vector(scale(delta, factor), max_delta))
 
     def _apply_wrist_posture_bias(
         self,
@@ -84,8 +107,15 @@ class PosePriorEstimator:
             if constraint is None:
                 continue
             wrist_delta = subtract(constraint.target_world_position, anatomy.rest(rest_name))
-            biased = add(biased, scale(wrist_delta, weight * constraint.strength))
+            biased = add(biased, scale(wrist_delta, weight * constraint.pose_intent_weight))
         return biased
+
+    @staticmethod
+    def _cap_vector(vector: Vec3, max_length: float) -> Vec3:
+        vector_length = length(vector)
+        if vector_length <= max_length or vector_length <= 0.0:
+            return vector
+        return scale(vector, max_length / vector_length)
 
     @staticmethod
     def _joint_model(rest_by_name: dict[str, BoneModel], name: str, parent_name: str | None, world_position: Vec3) -> JointModel:

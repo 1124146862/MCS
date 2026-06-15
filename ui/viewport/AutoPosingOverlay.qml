@@ -18,6 +18,7 @@ Item {
     property int projectionRevision: 0
     property string draggingControllerId: ""
     property vector3d draggingWorldPosition: Qt.vector3d(0, 0, 0)
+    property var contextMenuModelData: null
 
     anchors.fill: parent
     visible: autoPosingVisible
@@ -38,25 +39,23 @@ Item {
     }
 
     function controllerSize(controller) {
-        if (controller.controllerType === "main")
+        if (controller.radiusRole === "main" || controller.controllerType === "main")
             return 18
-        if (controller.controllerType === "direction")
+        if (controller.radiusRole === "direction" || controller.controllerType === "direction")
             return 14
+        if (controller.radiusRole === "finger" || controller.role === "finger_tip" || controller.role === "finger_pre_tip")
+            return 8
+        if (controller.radiusRole === "lesser" || controller.role === "lesser")
+            return 10
         return 12
     }
 
     function controllerFillColor(controller) {
-        if (controller.active)
-            return "#2a98ff"
-        return "#3fae56"
+        return controller.visualColor ? controller.visualColor : (controller.active ? "#2a98ff" : "#3fae56")
     }
 
     function controllerBorderColor(controller) {
-        if (controller.selected)
-            return "#fff5bf"
-        if (controller.fixed)
-            return "#ffb347"
-        return "#0f2718"
+        return controller.borderColor ? controller.borderColor : (controller.selected ? "#fff5bf" : "#0f2718")
     }
 
     function lineColor(segment) {
@@ -176,6 +175,12 @@ Item {
         return Qt.vector3d(fallbackX, fallbackY, fallbackZ)
     }
 
+    function fixedDirectionRodEnd(controllerId, base, fallbackX, fallbackY, fallbackZ, length) {
+        const rawEnd = root.draggedPositionOrFallback(controllerId, fallbackX, fallbackY, fallbackZ)
+        const direction = normalizeVector(vectorSubtract(rawEnd, base))
+        return vectorAdd(base, vectorScale(direction, length))
+    }
+
     Keys.onPressed: event => {
         if (!root.autoPosingVisible || root.documentViewModel === null)
             return
@@ -187,13 +192,106 @@ Item {
         }
 
         if (event.key === Qt.Key_Z && (event.modifiers & Qt.ShiftModifier)) {
-            root.documentViewModel.resetSelectedAutoPosingController()
+            root.documentViewModel.unlockOrResetSelectedAutoPosingController()
             event.accepted = true
         }
     }
 
+    Menu {
+        id: controllerContextMenu
+
+        property var itemData: root.contextMenuModelData
+        readonly property bool hasController: itemData !== null
+        readonly property bool direction: hasController && itemData.menuKind === "direction"
+
+        MenuItem {
+            text: controllerContextMenu.direction
+                  ? (controllerContextMenu.itemData && controllerContextMenu.itemData.locked ? qsTr("Unlock Direction") : qsTr("Lock Direction"))
+                  : (controllerContextMenu.itemData && controllerContextMenu.itemData.locked ? qsTr("Unlock") : qsTr("Lock"))
+            enabled: controllerContextMenu.hasController
+                     && (controllerContextMenu.itemData.canLock || controllerContextMenu.itemData.canUnlock)
+            onTriggered: {
+                if (!controllerContextMenu.itemData)
+                    return
+                if (controllerContextMenu.itemData.locked)
+                    root.documentViewModel.unlockAutoPosingController(controllerContextMenu.itemData.id)
+                else
+                    root.documentViewModel.lockAutoPosingController(controllerContextMenu.itemData.id)
+            }
+        }
+
+        MenuItem {
+            text: controllerContextMenu.direction
+                  ? (controllerContextMenu.itemData && controllerContextMenu.itemData.fixed ? qsTr("Unfix Direction") : qsTr("Fix Direction"))
+                  : (controllerContextMenu.itemData && controllerContextMenu.itemData.fixed ? qsTr("Unfix") : qsTr("Fix"))
+            enabled: controllerContextMenu.hasController
+                     && (controllerContextMenu.itemData.canFix || controllerContextMenu.itemData.canUnfix)
+            onTriggered: {
+                if (!controllerContextMenu.itemData)
+                    return
+                if (controllerContextMenu.itemData.fixed)
+                    root.documentViewModel.unfixAutoPosingController(controllerContextMenu.itemData.id)
+                else
+                    root.documentViewModel.fixAutoPosingController(controllerContextMenu.itemData.id)
+            }
+        }
+
+        MenuSeparator {}
+
+        MenuItem {
+            text: controllerContextMenu.direction ? qsTr("Reset Direction") : qsTr("Reset")
+            enabled: controllerContextMenu.hasController
+            onTriggered: {
+                if (controllerContextMenu.itemData)
+                    root.documentViewModel.resetAutoPosingController(controllerContextMenu.itemData.id)
+            }
+        }
+    }
+
     Repeater {
-        model: root.documentViewModel ? root.documentViewModel.autoPosingSegments : []
+        model: root.documentViewModel ? root.documentViewModel.autoPosingTopologyEdges : []
+
+        delegate: Item {
+            id: topologyEdgeItem
+
+            required property var modelData
+
+            readonly property vector3d startWorldPosition: Qt.vector3d(
+                                                               modelData.startX,
+                                                               modelData.startY,
+                                                               modelData.startZ)
+            readonly property vector3d endWorldPosition: Qt.vector3d(
+                                                             modelData.endX,
+                                                             modelData.endY,
+                                                             modelData.endZ)
+            readonly property vector3d startScreen: root.projectPoint(startWorldPosition.x, startWorldPosition.y, startWorldPosition.z)
+            readonly property vector3d endScreen: root.projectPoint(endWorldPosition.x, endWorldPosition.y, endWorldPosition.z)
+            readonly property real deltaX: endScreen.x - startScreen.x
+            readonly property real deltaY: endScreen.y - startScreen.y
+            readonly property real segmentLength: Math.sqrt(deltaX * deltaX + deltaY * deltaY)
+
+            visible: root.autoPosingVisible && modelData.visible && startScreen.z > 0 && endScreen.z > 0 && segmentLength > 4
+
+            x: startScreen.x
+            y: startScreen.y
+            width: segmentLength
+            height: 2
+            rotation: Math.atan2(deltaY, deltaX) * 180 / Math.PI
+            transformOrigin: Item.Left
+
+            Rectangle {
+                anchors.verticalCenter: parent.verticalCenter
+                width: parent.width
+                height: 2
+                radius: 1
+                color: root.lineColor(topologyEdgeItem.modelData)
+                opacity: 0.82
+            }
+        }
+    }
+
+    Repeater {
+        model: root.documentViewModel ? root.documentViewModel.autoPosingPressureTethers : []
 
         delegate: Item {
             id: segmentItem
@@ -237,6 +335,51 @@ Item {
     }
 
     Repeater {
+        model: root.documentViewModel ? root.documentViewModel.autoPosingDirectionRods : []
+
+        delegate: Item {
+            id: directionRodItem
+
+            required property var modelData
+
+            readonly property vector3d startWorldPosition: Qt.vector3d(
+                                                                 modelData.startX,
+                                                                 modelData.startY,
+                                                                 modelData.startZ)
+            readonly property vector3d endWorldPosition: root.fixedDirectionRodEnd(
+                                                               modelData.id,
+                                                               startWorldPosition,
+                                                               modelData.endX,
+                                                               modelData.endY,
+                                                               modelData.endZ,
+                                                               modelData.length)
+            readonly property vector3d startScreen: root.projectPoint(startWorldPosition.x, startWorldPosition.y, startWorldPosition.z)
+            readonly property vector3d endScreen: root.projectPoint(endWorldPosition.x, endWorldPosition.y, endWorldPosition.z)
+            readonly property real deltaX: endScreen.x - startScreen.x
+            readonly property real deltaY: endScreen.y - startScreen.y
+            readonly property real segmentLength: Math.sqrt(deltaX * deltaX + deltaY * deltaY)
+
+            visible: root.autoPosingVisible && modelData.visible && startScreen.z > 0 && endScreen.z > 0 && segmentLength > 6
+
+            x: startScreen.x
+            y: startScreen.y
+            width: segmentLength
+            height: 3
+            rotation: Math.atan2(deltaY, deltaX) * 180 / Math.PI
+            transformOrigin: Item.Left
+
+            Rectangle {
+                anchors.verticalCenter: parent.verticalCenter
+                width: parent.width
+                height: directionRodItem.modelData.selected ? 3 : 2
+                radius: 1
+                color: root.lineColor(directionRodItem.modelData)
+                opacity: directionRodItem.modelData.fixed ? 1.0 : 0.9
+            }
+        }
+    }
+
+    Repeater {
         model: root.documentViewModel ? root.documentViewModel.autoPosingControllerVisuals : []
 
         delegate: Item {
@@ -261,6 +404,7 @@ Item {
 
             visible: root.autoPosingVisible
                      && modelData.visible
+                     && !modelData.isDirection
                      && projected.z > 0
                      && (modelData.showGhostTarget || root.draggingControllerId === modelData.id)
             width: ghostDiameter + 8
@@ -291,10 +435,22 @@ Item {
 
             required property var modelData
 
-            readonly property vector3d displayWorldPosition: Qt.vector3d(
-                                                                 modelData.displayX,
-                                                                 modelData.displayY,
-                                                                 modelData.displayZ)
+            readonly property vector3d baseWorldPosition: Qt.vector3d(
+                                                            modelData.baseX,
+                                                            modelData.baseY,
+                                                            modelData.baseZ)
+            readonly property vector3d displayWorldPosition: modelData.isDirection
+                                                              ? root.fixedDirectionRodEnd(
+                                                                  modelData.id,
+                                                                  baseWorldPosition,
+                                                                  modelData.displayX,
+                                                                  modelData.displayY,
+                                                                  modelData.displayZ,
+                                                                  modelData.directionLength)
+                                                              : Qt.vector3d(
+                                                                  modelData.displayX,
+                                                                  modelData.displayY,
+                                                                  modelData.displayZ)
             readonly property vector3d projected: root.projectPoint(
                                                       displayWorldPosition.x,
                                                       displayWorldPosition.y,
@@ -312,9 +468,9 @@ Item {
                 anchors.centerIn: parent
                 width: controllerItem.controllerDiameter + ((controllerItem.modelData.selected || root.draggingControllerId === controllerItem.modelData.id) ? 10 : 4)
                 height: width
-                radius: width / 2
+                radius: controllerItem.modelData.shape === "square" ? 4 : width / 2
                 color: (controllerItem.modelData.selected || root.draggingControllerId === controllerItem.modelData.id) ? "#55ffd44d" : "#14000000"
-                border.color: controllerItem.modelData.fixed ? "#ffb347" : "transparent"
+                border.color: controllerItem.modelData.fixed ? controllerItem.modelData.borderColor : "transparent"
                 border.width: controllerItem.modelData.fixed ? 2 : 0
             }
 
@@ -323,7 +479,7 @@ Item {
                 anchors.centerIn: parent
                 width: controllerItem.controllerDiameter
                 height: controllerItem.controllerDiameter
-                radius: controllerItem.modelData.controllerType === "direction" ? 3 : width / 2
+                radius: controllerItem.modelData.shape === "square" ? 3 : width / 2
                 color: root.controllerFillColor(controllerItem.modelData)
                 border.color: (root.draggingControllerId === controllerItem.modelData.id)
                               ? "#fff5bf"
@@ -343,7 +499,19 @@ Item {
 
             required property var modelData
 
-            readonly property vector3d handleWorldPosition: root.draggedPositionOrFallback(
+            readonly property vector3d baseWorldPosition: Qt.vector3d(
+                                                            modelData.baseX,
+                                                            modelData.baseY,
+                                                            modelData.baseZ)
+            readonly property vector3d handleWorldPosition: modelData.isDirection
+                                                             ? root.fixedDirectionRodEnd(
+                                                                 modelData.id,
+                                                                 baseWorldPosition,
+                                                                 modelData.handleX,
+                                                                 modelData.handleY,
+                                                                 modelData.handleZ,
+                                                                 modelData.directionLength)
+                                                             : root.draggedPositionOrFallback(
                                                                  modelData.id,
                                                                  modelData.handleX,
                                                                  modelData.handleY,
@@ -435,6 +603,17 @@ Item {
                 onDoubleTapped: eventPoint => {
                     root.forceActiveFocus()
                     root.documentViewModel.selectAutoPosingController(handleItem.modelData.id)
+                }
+            }
+
+            TapHandler {
+                acceptedButtons: Qt.RightButton
+
+                onTapped: eventPoint => {
+                    root.forceActiveFocus()
+                    root.contextMenuModelData = handleItem.modelData
+                    root.documentViewModel.selectAutoPosingController(handleItem.modelData.id)
+                    controllerContextMenu.popup()
                 }
             }
 

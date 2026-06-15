@@ -1,4 +1,5 @@
 from .models import (
+    AutoPosingControllerEdgeModel,
     AutoPosingControllerModel,
     PreviewFrameModel,
     AutoPosingRigModel,
@@ -11,6 +12,7 @@ from .models import (
 
 __all__ = [
     "AutoPosingControllerModel",
+    "AutoPosingControllerEdgeModel",
     "PreviewFrameModel",
     "AutoPosingRigModel",
     "ControllerTargetModel",

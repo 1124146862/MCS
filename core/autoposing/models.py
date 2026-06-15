@@ -23,11 +23,21 @@ class AutoPosingControllerModel:
     controller_type: str
     joint_name: str
     target: ControllerTargetModel
+    role: str = ""
     visible: bool = True
     active: bool = False
     fixed: bool = False
     always_active: bool = False
     selected: bool = False
+
+
+@dataclass(slots=True)
+class AutoPosingControllerEdgeModel:
+    start_controller_id: str
+    end_controller_id: str
+    edge_type: str = "topology"
+    rest_length: float = 0.0
+    visible: bool = True
 
 
 @dataclass(slots=True)
@@ -77,5 +87,8 @@ class PreviewFrameModel:
 @dataclass(slots=True)
 class AutoPosingRigModel:
     controllers: list[AutoPosingControllerModel] = field(default_factory=list)
+    controller_edges: list[AutoPosingControllerEdgeModel] = field(default_factory=list)
     current_mode: str = "view"
     selected_controller_id: str | None = None
+    fingers_enabled: bool = False
+    finger_defaults_initialized: bool = False

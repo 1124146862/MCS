@@ -70,6 +70,7 @@ CMakeLists.txt.user*
 # Python byte code and cache
 *.pyc
 __pycache__/
+.venv/
 
 # Binaries
 *.dll

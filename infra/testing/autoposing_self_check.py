@@ -9,6 +9,7 @@ from PySide6.QtQml import QQmlComponent, QQmlEngine
 
 from app.autoposing.anatomy_profile import build_humanoid_anatomy_profile
 from app.autoposing.constraints import extract_pose_constraints
+from app.autoposing.controller_layout import direction_rod_length
 from app.autoposing.pose_prior import PosePriorEstimator
 from app.autoposing.preview_pipeline import AutoPosingPreviewPipeline
 from app.autoposing.runtime_retargeter import RuntimeRetargeter
@@ -434,9 +435,15 @@ def _run_viewmodel_drag_signal_split_check() -> CheckResult:
         float(visual_row["displayY"]),
         float(visual_row["displayZ"]),
     ) == flushed_effector.solved_world_position
-    skeleton_ok = len(view_model._autoposing_preview_joints_data()) > 0 and len(view_model._autoposing_preview_bones_data()) > 0
+    normal_skeleton_hidden = len(view_model._autoposing_preview_joints_data()) == 0 and len(view_model._autoposing_preview_bones_data()) == 0
+    handles_before_debug = len(handle_emits)
+    view_model.setAutoPosingDebugVisible(True)
+    debug_handle_emit = len(handle_emits) - handles_before_debug == 1
+    debug_skeleton_visible = len(view_model._autoposing_preview_joints_data()) > 0 and len(view_model._autoposing_preview_bones_data()) > 0
 
+    handles_before_end = len(handle_emits)
     view_model.endAutoPosingDrag("wrist_l_main")
+    end_handle_emit = len(handle_emits) - handles_before_end == 1
     handle_row = _controller_data(view_model._autoposing_controller_handles_data(), "wrist_l_main")
     final_effector = _effector(context.document.preview_frame.solved_pose, "wrist_l_main")
     handle_ok = (
@@ -456,17 +463,58 @@ def _run_viewmodel_drag_signal_split_check() -> CheckResult:
         and after_flush_preview == 1
         and flushed_revision >= 2
         and visual_ok
-        and skeleton_ok
-        and len(handle_emits) == 1
+        and normal_skeleton_hidden
+        and debug_skeleton_visible
+        and handles_before_debug == 0
+        and debug_handle_emit
+        and end_handle_emit
         and handle_ok
         and len(autoposing_emits) >= 2
     )
     details = (
         f"handles={len(handle_emits)}, preview={len(preview_emits)}, "
         f"revision={context.document.preview_frame.revision}, target_ok={target_ok}, "
-        f"visual_ok={visual_ok}, handle_ok={handle_ok}"
+        f"visual_ok={visual_ok}, handle_ok={handle_ok}, "
+        f"normal_skeleton_hidden={normal_skeleton_hidden}, debug_skeleton_visible={debug_skeleton_visible}, "
+        f"debug_handle_emit={debug_handle_emit}, end_handle_emit={end_handle_emit}"
     )
     return CheckResult("viewmodel drag signal split", passed, details)
+
+
+def _run_normal_tether_filter_check() -> CheckResult:
+    context = _fresh_context()
+    view_model = DocumentViewModel(context.document)
+    controller = _controller(context.document, "wrist_l_main")
+    start = controller.target.world_position
+    target = (start[0] - 95.0, start[1] + 45.0, start[2] + 70.0)
+
+    view_model.beginAutoPosingDrag("wrist_l_main")
+    view_model.previewAutoPosingController("wrist_l_main", *target)
+    view_model._flush_preview_request()
+
+    controllers_by_id = {controller.identifier: controller for controller in context.document.autoposing.controllers}
+    tether_rows = view_model._autoposing_pressure_tethers_data()
+    inactive_tethers = [
+        row["startId"]
+        for row in tether_rows
+        if not (
+            controllers_by_id[row["startId"]].active
+            or controllers_by_id[row["startId"]].fixed
+            or controllers_by_id[row["startId"]].selected
+            or controllers_by_id[row["startId"]].always_active
+        )
+    ]
+
+    view_model.setAutoPosingDebugVisible(True)
+    debug_tether_count = len(view_model._autoposing_pressure_tethers_data())
+    view_model.endAutoPosingDrag("wrist_l_main")
+
+    passed = not inactive_tethers and debug_tether_count >= len(tether_rows)
+    details = (
+        f"normal_tethers={[row['startId'] for row in tether_rows]}, "
+        f"inactive_tethers={inactive_tethers}, debug_tether_count={debug_tether_count}"
+    )
+    return CheckResult("normal tether filter", passed, details)
 
 
 def _run_constraint_extraction_check() -> CheckResult:
@@ -503,6 +551,47 @@ def _run_constraint_extraction_check() -> CheckResult:
     return CheckResult("constraint extraction", passed, details)
 
 
+def _run_constraint_influence_check() -> CheckResult:
+    context = _fresh_context()
+    document = context.document
+    wrist_l = _controller(document, "wrist_l_main")
+    wrist_r = _controller(document, "wrist_r_main")
+    elbow = _controller(document, "elbow_l_secondary")
+    context.service.move_controller(
+        document.autoposing,
+        "wrist_l_main",
+        (wrist_l.target.world_position[0] - 30.0, wrist_l.target.world_position[1] + 20.0, wrist_l.target.world_position[2]),
+    )
+    context.service.move_controller(
+        document.autoposing,
+        "wrist_r_main",
+        (wrist_r.target.world_position[0] + 30.0, wrist_r.target.world_position[1] + 20.0, wrist_r.target.world_position[2]),
+    )
+    context.service.fix_controller(document.autoposing, "wrist_r_main")
+    context.service.fix_controller(document.autoposing, "elbow_l_secondary", elbow.target.world_position)
+    anatomy = build_humanoid_anatomy_profile(document.skeleton)
+    constraints = extract_pose_constraints(document.autoposing, anatomy)
+    active_wrist = constraints.positions["wrist_l_main"]
+    fixed_wrist = constraints.positions["wrist_r_main"]
+    fixed_elbow = constraints.positions["elbow_l_secondary"]
+    ankle = constraints.positions["ankle_l_main"]
+    passed = (
+        active_wrist.pose_intent_weight >= 0.95
+        and fixed_wrist.preservation_weight >= 0.99
+        and fixed_wrist.pose_intent_weight < active_wrist.pose_intent_weight * 0.2
+        and fixed_elbow.pose_intent_weight == 0.0
+        and ankle.support_weight >= 0.99
+        and ankle.pose_intent_weight <= 0.11
+    )
+    details = (
+        f"active_wrist_intent={active_wrist.pose_intent_weight:.2f}, "
+        f"fixed_wrist_intent={fixed_wrist.pose_intent_weight:.2f}, "
+        f"fixed_elbow_intent={fixed_elbow.pose_intent_weight:.2f}, "
+        f"ankle_support={ankle.support_weight:.2f}, ankle_intent={ankle.pose_intent_weight:.2f}"
+    )
+    return CheckResult("constraint influence semantics", passed, details)
+
+
 def _run_anatomy_profile_check() -> CheckResult:
     context = _fresh_context()
     anatomy = build_humanoid_anatomy_profile(context.document.skeleton)
@@ -513,10 +602,18 @@ def _run_anatomy_profile_check() -> CheckResult:
         for chain in anatomy.limb_chains.values()
     )
     support_ok = "foot_l" in anatomy.support_joint_names and "foot_r" in anatomy.support_joint_names
-    passed = complete_required and chains_ok and support_ok and anatomy.length("thigh_l", "foot_l") > 0.0
+    frames_ok = (
+        anatomy.body_height > 1.0
+        and anatomy.torso_length > 0.0
+        and anatomy.arm_length("l") > 0.0
+        and anatomy.leg_length("l") > 0.0
+        and anatomy.foot_length("l") > 0.0
+    )
+    passed = complete_required and chains_ok and support_ok and frames_ok and anatomy.length("thigh_l", "foot_l") > 0.0
     details = (
         f"required={complete_required}, chains={chains_ok}, supports={anatomy.support_joint_names}, "
-        f"floor_y={anatomy.floor_y:.3f}"
+        f"floor_y={anatomy.floor_y:.3f}, body_height={anatomy.body_height:.3f}, "
+        f"arm_l={anatomy.arm_length('l'):.3f}, leg_l={anatomy.leg_length('l'):.3f}"
     )
     return CheckResult("anatomy profile", passed, details)
 
@@ -582,6 +679,649 @@ def _run_support_rule_check() -> CheckResult:
     return CheckResult("support rules", passed, details)
 
 
+def _run_shoulder_girdle_check() -> CheckResult:
+    context = _fresh_context()
+    document = context.document
+    anatomy = build_humanoid_anatomy_profile(document.skeleton)
+    wrist = _controller(document, "wrist_l_main")
+    start = wrist.target.world_position
+    context.service.move_controller(
+        document.autoposing,
+        "wrist_l_main",
+        (start[0] - 140.0, start[1] + 90.0, start[2] + 120.0),
+    )
+    _solve_context(context)
+    clavicle_delta = distance(
+        _bone_from_skeleton(document.skeleton, "clavicle_l").rest_world_position,
+        _joint_from_rig(document.solver_rig, "clavicle_l").world_position,
+    )
+    chest_delta = distance(
+        _bone_from_skeleton(document.skeleton, "spine_05").rest_world_position,
+        _joint_from_rig(document.solver_rig, "spine_05").world_position,
+    )
+    pelvis_delta = distance(
+        _bone_from_skeleton(document.skeleton, "pelvis").rest_world_position,
+        _joint_from_rig(document.solver_rig, "pelvis").world_position,
+    )
+    head_delta = distance(
+        _bone_from_skeleton(document.skeleton, "head").rest_world_position,
+        _joint_from_rig(document.solver_rig, "head").world_position,
+    )
+    passed = (
+        clavicle_delta > anatomy.arm_length("l") * 0.015
+        and chest_delta > pelvis_delta * 0.5
+        and head_delta < max(chest_delta * 1.5, anatomy.body_height * 0.12)
+    )
+    details = (
+        f"clavicle_delta={clavicle_delta:.3f}, chest_delta={chest_delta:.3f}, "
+        f"pelvis_delta={pelvis_delta:.3f}, head_delta={head_delta:.3f}, arm_l={anatomy.arm_length('l'):.3f}"
+    )
+    return CheckResult("shoulder girdle recruitment", passed, details)
+
+
+def _run_support_stability_check() -> CheckResult:
+    context = _fresh_context()
+    document = context.document
+    anatomy = build_humanoid_anatomy_profile(document.skeleton)
+    right_foot_rest = _bone_from_skeleton(document.skeleton, "foot_r").rest_world_position
+    right_ball_rest = _bone_from_skeleton(document.skeleton, "ball_r").rest_world_position
+    ankle = _controller(document, "ankle_l_main")
+    start = ankle.target.world_position
+    context.service.move_controller(
+        document.autoposing,
+        "ankle_l_main",
+        (start[0] + 90.0, start[1] + 120.0, start[2] + 70.0),
+    )
+    _solve_context(context)
+    right_foot_delta = distance(right_foot_rest, _joint_from_rig(document.solver_rig, "foot_r").world_position)
+    right_ball_delta = distance(right_ball_rest, _joint_from_rig(document.solver_rig, "ball_r").world_position)
+    pelvis_delta = distance(
+        _bone_from_skeleton(document.skeleton, "pelvis").rest_world_position,
+        _joint_from_rig(document.solver_rig, "pelvis").world_position,
+    )
+    passed = (
+        right_foot_delta < anatomy.body_height * 0.015
+        and right_ball_delta < anatomy.body_height * 0.020
+        and pelvis_delta > anatomy.body_height * 0.005
+    )
+    details = (
+        f"right_foot_delta={right_foot_delta:.3f}, right_ball_delta={right_ball_delta:.3f}, "
+        f"pelvis_delta={pelvis_delta:.3f}, body_height={anatomy.body_height:.3f}"
+    )
+    return CheckResult("support foot stability", passed, details)
+
+
+def _run_visual_policy_check() -> CheckResult:
+    context = _fresh_context()
+    view_model = DocumentViewModel(context.document)
+    normal_joints_hidden = len(view_model._autoposing_preview_joints_data()) == 0
+    controller_rows = view_model._autoposing_controller_visuals_data()
+    has_finger_controller = any("finger" in str(row["jointName"]).lower() for row in controller_rows)
+    wrist_row = _controller_data(controller_rows, "wrist_l_main")
+    ankle_row = _controller_data(controller_rows, "ankle_l_main")
+    view_model.setAutoPosingDebugVisible(True)
+    debug_joints_visible = len(view_model._autoposing_preview_joints_data()) > 0
+    passed = (
+        normal_joints_hidden
+        and debug_joints_visible
+        and not has_finger_controller
+        and wrist_row["visualColor"] == "#3fae56"
+        and ankle_row["locked"]
+        and ankle_row["visualColor"] == "#2a98ff"
+    )
+    details = (
+        f"normal_joints_hidden={normal_joints_hidden}, debug_joints_visible={debug_joints_visible}, "
+        f"controllers={len(controller_rows)}, has_finger_controller={has_finger_controller}"
+    )
+    return CheckResult("visual policy", passed, details)
+
+
+def _run_controller_schema_topology_check() -> CheckResult:
+    context = _fresh_context()
+    view_model = DocumentViewModel(context.document)
+    controller_ids = {controller.identifier for controller in context.document.autoposing.controllers}
+    edge_pairs = {
+        (edge.start_controller_id, edge.end_controller_id)
+        for edge in context.document.autoposing.controller_edges
+    }
+    required_controllers = {
+        "pelvis_additional",
+        "stomach_secondary",
+        "chest_additional",
+        "head_additional",
+        "shoulder_l_lesser",
+        "hand_l_secondary",
+        "hand_l_additional",
+        "foot_l_secondary",
+        "ball_l_lesser",
+        "foot_l_additional",
+        "shoulder_r_lesser",
+        "hand_r_secondary",
+        "foot_r_secondary",
+    }
+    required_edges = {
+        ("shoulder_l_lesser", "elbow_l_secondary"),
+        ("elbow_l_secondary", "wrist_l_main"),
+        ("wrist_l_main", "hand_l_secondary"),
+        ("hand_l_secondary", "hand_l_additional"),
+        ("hip_l_lesser", "knee_l_secondary"),
+        ("knee_l_secondary", "ankle_l_main"),
+        ("ankle_l_main", "foot_l_secondary"),
+        ("foot_l_secondary", "ball_l_lesser"),
+        ("pelvis_main", "stomach_secondary"),
+        ("stomach_secondary", "chest_secondary"),
+        ("chest_secondary", "chest_additional"),
+    }
+    topology_rows = view_model._autoposing_topology_edges_data()
+    normal_skeleton_hidden = len(view_model._autoposing_preview_joints_data()) == 0
+    passed = (
+        required_controllers.issubset(controller_ids)
+        and required_edges.issubset(edge_pairs)
+        and len(topology_rows) >= len(required_edges)
+        and normal_skeleton_hidden
+        and all(float(row["restLength"]) > 0.001 for row in topology_rows)
+    )
+    missing_controllers = sorted(required_controllers - controller_ids)
+    missing_edges = sorted(required_edges - edge_pairs)
+    details = (
+        f"controllers={len(controller_ids)}, edges={len(edge_pairs)}, topology_rows={len(topology_rows)}, "
+        f"missing_controllers={missing_controllers}, missing_edges={missing_edges}, "
+        f"normal_skeleton_hidden={normal_skeleton_hidden}"
+    )
+    return CheckResult("controller schema topology", passed, details)
+
+
+def _run_schema_layout_offset_check() -> CheckResult:
+    context = _fresh_context()
+    view_model = DocumentViewModel(context.document)
+
+    wrist = _controller(context.document, "wrist_l_main")
+    wrist_start = wrist.target.world_position
+    wrist_target = (wrist_start[0] - 32.0, wrist_start[1] + 16.0, wrist_start[2] + 12.0)
+    view_model.beginAutoPosingDrag("wrist_l_main")
+    view_model.previewAutoPosingController("wrist_l_main", *wrist_target)
+    view_model.endAutoPosingDrag("wrist_l_main")
+    hand_secondary = _controller(context.document, "hand_l_secondary")
+    hand_additional = _controller(context.document, "hand_l_additional")
+    hand_cluster_ok = (
+        distance(wrist.target.world_position, hand_secondary.target.world_position) > 3.0
+        and distance(hand_secondary.target.world_position, hand_additional.target.world_position) > 3.0
+    )
+
+    ankle = _controller(context.document, "ankle_l_main")
+    ankle_start = ankle.target.world_position
+    ankle_target = (ankle_start[0] + 18.0, ankle_start[1] + 10.0, ankle_start[2] + 20.0)
+    view_model.beginAutoPosingDrag("ankle_l_main")
+    view_model.previewAutoPosingController("ankle_l_main", *ankle_target)
+    view_model.endAutoPosingDrag("ankle_l_main")
+    foot_secondary = _controller(context.document, "foot_l_secondary")
+    foot_additional = _controller(context.document, "foot_l_additional")
+    foot_cluster_ok = (
+        distance(ankle.target.world_position, foot_secondary.target.world_position) > 3.0
+        and distance(foot_secondary.target.world_position, foot_additional.target.world_position) > 3.0
+    )
+
+    passed = hand_cluster_ok and foot_cluster_ok
+    details = (
+        f"hand_cluster_ok={hand_cluster_ok}, foot_cluster_ok={foot_cluster_ok}, "
+        f"hand_wrist_gap={distance(wrist.target.world_position, hand_secondary.target.world_position):.3f}, "
+        f"foot_ankle_gap={distance(ankle.target.world_position, foot_secondary.target.world_position):.3f}"
+    )
+    return CheckResult("schema layout offsets", passed, details)
+
+
+def _run_semantic_constraint_extraction_check() -> CheckResult:
+    context = _fresh_context()
+    document = context.document
+    anatomy = build_humanoid_anatomy_profile(document.skeleton)
+    for controller_id in (
+        "elbow_l_secondary",
+        "hand_l_additional",
+        "foot_l_additional",
+        "ball_l_lesser",
+        "chest_additional",
+    ):
+        controller = _controller(document, controller_id)
+        start = controller.target.world_position
+        context.service.move_controller(document.autoposing, controller_id, (start[0] + 8.0, start[1] + 5.0, start[2] + 6.0))
+
+    constraints = extract_pose_constraints(document.autoposing, anatomy)
+    passed = (
+        "elbow_l_secondary" in constraints.bend_hints
+        and "hand_l_additional" in constraints.orientation_hints
+        and "foot_l_additional" in constraints.orientation_hints
+        and "ball_l_lesser" in constraints.foot_contacts
+        and "chest_additional" in constraints.orientation_hints
+    )
+    details = (
+        f"bend={sorted(constraints.bend_hints)}, "
+        f"orientation={sorted(constraints.orientation_hints)}, foot_contacts={sorted(constraints.foot_contacts)}"
+    )
+    return CheckResult("semantic constraint extraction", passed, details)
+
+
+def _run_bend_hint_semantics_check() -> CheckResult:
+    context = _fresh_context()
+    document = context.document
+    elbow = _controller(document, "elbow_l_secondary")
+    start = elbow.target.world_position
+    target = (start[0] - 50.0, start[1] + 24.0, start[2] + 28.0)
+    context.service.move_controller(document.autoposing, "elbow_l_secondary", target)
+    _solve_context(context)
+    solved_elbow = _joint_from_rig(document.solver_rig, "lowerarm_l")
+    elbow_motion = distance(solved_elbow.world_position, _bone_from_skeleton(document.skeleton, "lowerarm_l").rest_world_position)
+    hint_error = distance(solved_elbow.world_position, target)
+    length_error = _chain_length_error(document.skeleton, document.solver_rig)
+    passed = elbow_motion > 4.0 and hint_error < 60.0 and length_error <= 0.0015
+    details = f"elbow_motion={elbow_motion:.3f}, hint_error={hint_error:.3f}, length_error={length_error:.6f}"
+    return CheckResult("bend hint semantics", passed, details)
+
+
+def _run_terminal_orientation_retarget_check() -> CheckResult:
+    context = _fresh_context()
+    document = context.document
+    hand = _controller(document, "hand_l_additional")
+    hand_start = hand.target.world_position
+    context.service.move_controller(document.autoposing, "hand_l_additional", (hand_start[0] - 42.0, hand_start[1] + 16.0, hand_start[2] + 34.0))
+    foot = _controller(document, "foot_l_additional")
+    foot_start = foot.target.world_position
+    context.service.move_controller(document.autoposing, "foot_l_additional", (foot_start[0] + 24.0, foot_start[1] + 18.0, foot_start[2] + 28.0))
+    _solve_context(context)
+
+    hand_pose = _retarget_joint(document.retarget_pose, "hand_l")
+    foot_pose = _retarget_joint(document.retarget_pose, "foot_l")
+    ball_pose = _retarget_joint(document.retarget_pose, "ball_l")
+    hand_rest = _bone_from_skeleton(document.skeleton, "hand_l")
+    foot_rest = _bone_from_skeleton(document.skeleton, "foot_l")
+    ball_rest = _bone_from_skeleton(document.skeleton, "ball_l")
+    hand_angle = _quaternion_angle_degrees(hand_pose.local_rotation, hand_rest.rest_local_rotation)
+    foot_angle = _quaternion_angle_degrees(foot_pose.local_rotation, foot_rest.rest_local_rotation)
+    ball_angle = _quaternion_angle_degrees(ball_pose.local_rotation, ball_rest.rest_local_rotation)
+    solved_wrist = _joint_from_rig(document.solver_rig, "hand_l")
+    wrist_drift = distance(solved_wrist.world_position, _bone_from_skeleton(document.skeleton, "hand_l").rest_world_position)
+    passed = hand_angle > 2.0 and foot_angle > 2.0 and ball_angle > 2.0 and wrist_drift < 5.0
+    details = (
+        f"hand_angle={hand_angle:.2f}, foot_angle={foot_angle:.2f}, "
+        f"ball_angle={ball_angle:.2f}, wrist_drift={wrist_drift:.3f}"
+    )
+    return CheckResult("terminal orientation retarget", passed, details)
+
+
+def _run_body_orientation_hint_check() -> CheckResult:
+    context = _fresh_context()
+    document = context.document
+    chest = _controller(document, "chest_additional")
+    chest_start = chest.target.world_position
+    context.service.move_controller(document.autoposing, "chest_additional", (chest_start[0] + 45.0, chest_start[1] + 10.0, chest_start[2] + 28.0))
+    head = _controller(document, "head_additional")
+    head_start = head.target.world_position
+    context.service.move_controller(document.autoposing, "head_additional", (head_start[0] + 28.0, head_start[1] + 12.0, head_start[2] + 22.0))
+    _solve_context(context)
+
+    spine_pose = _retarget_joint(document.retarget_pose, "spine_05")
+    head_pose = _retarget_joint(document.retarget_pose, "head")
+    spine_rest = _bone_from_skeleton(document.skeleton, "spine_05")
+    head_rest = _bone_from_skeleton(document.skeleton, "head")
+    spine_angle = _quaternion_angle_degrees(spine_pose.local_rotation, spine_rest.rest_local_rotation)
+    head_angle = _quaternion_angle_degrees(head_pose.local_rotation, head_rest.rest_local_rotation)
+    passed = spine_angle > 2.0 and head_angle > 2.0
+    details = f"spine_angle={spine_angle:.2f}, head_angle={head_angle:.2f}"
+    return CheckResult("body orientation hint", passed, details)
+
+
+def _run_direction_rods_check() -> CheckResult:
+    context = _fresh_context()
+    view_model = DocumentViewModel(context.document)
+    rods = view_model._autoposing_direction_rods_data()
+    initial_ok = all(
+        abs(
+            distance(
+                (float(row["startX"]), float(row["startY"]), float(row["startZ"])),
+                (float(row["endX"]), float(row["endY"]), float(row["endZ"])),
+            )
+            - direction_rod_length(str(row["id"]))
+        )
+        <= 0.001
+        for row in rods
+    )
+
+    chest = _controller(context.document, "chest_dir")
+    start = chest.target.world_position
+    context.service.move_controller(context.document.autoposing, "chest_dir", (start[0] + 120.0, start[1] + 40.0, start[2] + 90.0))
+    frame = context.adapter.solve_frame(context.document.autoposing, context.document.skeleton, revision=1)
+    view_model._commit_preview_frame(frame)
+    chest_rod = _controller_data(view_model._autoposing_direction_rods_data(), "chest_dir")
+    chest_length = distance(
+        (float(chest_rod["startX"]), float(chest_rod["startY"]), float(chest_rod["startZ"])),
+        (float(chest_rod["endX"]), float(chest_rod["endY"]), float(chest_rod["endZ"])),
+    )
+    passed = initial_ok and abs(chest_length - 30.0) <= 0.001
+    details = f"initial_ok={initial_ok}, chest_length={chest_length:.3f}"
+    return CheckResult("direction rods", passed, details)
+
+
+def _run_controller_menu_state_check() -> CheckResult:
+    context = _fresh_context()
+    view_model = DocumentViewModel(context.document)
+    wrist = view_model.autoPosingControllerMenuState("wrist_l_main")
+    ankle = view_model.autoPosingControllerMenuState("ankle_l_main")
+    direction = view_model.autoPosingControllerMenuState("chest_dir")
+    passed = (
+        wrist["menuKind"] == "controller"
+        and wrist["canLock"]
+        and not wrist["canUnlock"]
+        and ankle["menuKind"] == "alwaysActive"
+        and ankle["locked"]
+        and not ankle["canLock"]
+        and not ankle["canUnlock"]
+        and direction["menuKind"] == "direction"
+        and direction["isDirection"]
+    )
+    details = f"wrist={wrist}, ankle={ankle}, direction={direction}"
+    return CheckResult("controller menu state", passed, details)
+
+
+def _run_lock_fix_layout_sync_check() -> CheckResult:
+    context = _fresh_context()
+    view_model = DocumentViewModel(context.document)
+
+    view_model.lockAutoPosingController("wrist_l_main")
+    wrist = _controller(context.document, "wrist_l_main")
+    locked_ok = wrist.active and _controller_data(view_model._autoposing_controller_visuals_data(), "wrist_l_main")["locked"]
+    view_model.unlockAutoPosingController("wrist_l_main")
+    unlocked_ok = not wrist.active and not _controller_data(view_model._autoposing_controller_visuals_data(), "wrist_l_main")["locked"]
+
+    view_model.fixAutoPosingController("elbow_l_secondary")
+    elbow = _controller(context.document, "elbow_l_secondary")
+    fixed_ok = elbow.fixed and _controller_data(view_model._autoposing_controller_visuals_data(), "elbow_l_secondary")["fixed"]
+    view_model.unfixAutoPosingController("elbow_l_secondary")
+    elbow_effector_after_unfix = _effector(context.document.preview_frame.solved_pose, "elbow_l_secondary")
+    unfixed_ok = not elbow.fixed and distance(elbow.target.world_position, elbow_effector_after_unfix.solved_world_position) < 0.001
+
+    wrist_start = wrist.target.world_position
+    view_model.beginAutoPosingDrag("wrist_l_main")
+    view_model.previewAutoPosingController("wrist_l_main", wrist_start[0] - 35.0, wrist_start[1] + 18.0, wrist_start[2] + 12.0)
+    view_model.endAutoPosingDrag("wrist_l_main")
+    elbow_effector = _effector(context.document.preview_frame.solved_pose, "elbow_l_secondary")
+    layout_ok = distance(elbow.target.world_position, elbow_effector.solved_world_position) < 0.001
+    target_preserved = distance(wrist.target.world_position, (wrist_start[0] - 35.0, wrist_start[1] + 18.0, wrist_start[2] + 12.0)) < 0.001
+
+    passed = locked_ok and unlocked_ok and fixed_ok and unfixed_ok and layout_ok and target_preserved
+    details = (
+        f"locked_ok={locked_ok}, unlocked_ok={unlocked_ok}, fixed_ok={fixed_ok}, "
+        f"unfixed_ok={unfixed_ok}, layout_ok={layout_ok}, target_preserved={target_preserved}"
+    )
+    return CheckResult("lock fix layout sync", passed, details)
+
+
+def _run_finger_schema_mode_check() -> CheckResult:
+    context = _fresh_context()
+    document = context.document
+    view_model = DocumentViewModel(document)
+    finger_controllers = [controller for controller in document.autoposing.controllers if controller.role.startswith("finger")]
+    default_mode = view_model._autoposing_display_mode_value() == "normal"
+    default_hidden = not any(row["role"] in {"finger_tip", "finger_pre_tip"} for row in view_model._autoposing_controller_visuals_data())
+    default_debug_hidden = len(view_model._autoposing_preview_joints_data()) == 0
+
+    view_model.setAutoPosingDisplayMode("fingers")
+    visible_rows = [row for row in view_model._autoposing_controller_visuals_data() if row["role"] in {"finger_tip", "finger_pre_tip"}]
+    topology_rows = view_model._autoposing_topology_edges_data()
+    index_l = _controller(document, "index_l_tip")
+    index_r = _controller(document, "index_r_tip")
+    finger_menu = view_model.autoPosingControllerMenuState("index_l_tip")
+    enabled_ok = (
+        view_model._autoposing_display_mode_value() == "fingers"
+        and len(finger_controllers) == 20
+        and len(visible_rows) == 20
+        and index_l.active
+        and index_r.active
+        and any(row["endId"] == "index_l_tip" for row in topology_rows)
+        and finger_menu["menuKind"] == "finger"
+    )
+
+    view_model.setAutoPosingDisplayMode("debug")
+    debug_rows = [row for row in view_model._autoposing_controller_visuals_data() if row["role"] in {"finger_tip", "finger_pre_tip"}]
+    debug_ok = (
+        view_model._autoposing_display_mode_value() == "debug"
+        and len(debug_rows) == 20
+        and len(view_model._autoposing_preview_joints_data()) > 0
+        and len(view_model._autoposing_preview_bones_data()) > 0
+    )
+
+    view_model.setAutoPosingDisplayMode("normal")
+    anatomy = build_humanoid_anatomy_profile(document.skeleton)
+    constraints = extract_pose_constraints(document.autoposing, anatomy)
+    disabled_hidden = not any(row["role"] in {"finger_tip", "finger_pre_tip"} for row in view_model._autoposing_controller_visuals_data())
+    passed = default_mode and default_hidden and default_debug_hidden and enabled_ok and debug_ok and disabled_hidden and not constraints.finger_tips
+    details = (
+        f"finger_count={len(finger_controllers)}, default_mode={default_mode}, default_hidden={default_hidden}, "
+        f"default_debug_hidden={default_debug_hidden}, enabled_ok={enabled_ok}, debug_ok={debug_ok}, "
+        f"disabled_hidden={disabled_hidden}, disabled_tip_constraints={len(constraints.finger_tips)}"
+    )
+    return CheckResult("finger schema mode", passed, details)
+
+
+def _run_finger_tip_retarget_check() -> CheckResult:
+    context = _fresh_context()
+    document = context.document
+    context.service.set_fingers_enabled(document.autoposing, True)
+    tip = _controller(document, "index_l_tip")
+    start = tip.target.world_position
+    context.service.move_controller(document.autoposing, "index_l_tip", (start[0] + 12.0, start[1] + 5.0, start[2] + 8.0))
+    _solve_context(context)
+
+    index_pose = _retarget_joint(document.retarget_pose, "index_01_l")
+    index_rest = _bone_from_skeleton(document.skeleton, "index_01_l")
+    hand = _joint_from_rig(document.solver_rig, "hand_l")
+    hand_rest = _bone_from_skeleton(document.skeleton, "hand_l")
+    effector = _effector(document.solved_pose, "index_l_tip")
+    index_angle = _quaternion_angle_degrees(index_pose.local_rotation, index_rest.rest_local_rotation)
+    hand_drift = distance(hand.world_position, hand_rest.rest_world_position)
+    passed = index_angle > 0.5 and hand_drift < 0.001 and distance(effector.solved_world_position, start) > 1.0
+    details = f"index_angle={index_angle:.3f}, hand_drift={hand_drift:.6f}, clamped={effector.clamped}"
+    return CheckResult("finger tip retarget", passed, details)
+
+
+def _run_finger_pre_tip_bend_check() -> CheckResult:
+    context = _fresh_context()
+    document = context.document
+    context.service.set_fingers_enabled(document.autoposing, True)
+    pre_tip = _controller(document, "index_l_pre_tip")
+    start = pre_tip.target.world_position
+    context.service.move_controller(document.autoposing, "index_l_pre_tip", (start[0] - 10.0, start[1] + 8.0, start[2] + 12.0))
+    _solve_context(context)
+
+    solved_mid = _joint_from_rig(document.solver_rig, "index_02_l")
+    rest_mid = _bone_from_skeleton(document.skeleton, "index_02_l")
+    index_pose = _retarget_joint(document.retarget_pose, "index_01_l")
+    index_rest = _bone_from_skeleton(document.skeleton, "index_01_l")
+    mid_motion = distance(solved_mid.world_position, rest_mid.rest_world_position)
+    index_angle = _quaternion_angle_degrees(index_pose.local_rotation, index_rest.rest_local_rotation)
+    passed = mid_motion > 0.5 and index_angle > 0.5
+    details = f"mid_motion={mid_motion:.3f}, index_angle={index_angle:.3f}"
+    return CheckResult("finger pre-tip bend", passed, details)
+
+
+def _run_finger_palm_spread_check() -> CheckResult:
+    pinky_context = _fresh_context()
+    pinky_doc = pinky_context.document
+    pinky_context.service.set_fingers_enabled(pinky_doc.autoposing, True)
+    pinky = _controller(pinky_doc, "pinky_l_tip")
+    pinky_start = pinky.target.world_position
+    pinky_context.service.move_controller(
+        pinky_doc.autoposing,
+        "pinky_l_tip",
+        (pinky_start[0] + 10.0, pinky_start[1] + 2.0, pinky_start[2] - 14.0),
+    )
+    _solve_context(pinky_context)
+    pinky_hand_angle = _quaternion_angle_degrees(
+        _retarget_joint(pinky_doc.retarget_pose, "hand_l").local_rotation,
+        _bone_from_skeleton(pinky_doc.skeleton, "hand_l").rest_local_rotation,
+    )
+
+    middle_context = _fresh_context()
+    middle_doc = middle_context.document
+    middle_context.service.set_fingers_enabled(middle_doc.autoposing, True)
+    middle = _controller(middle_doc, "middle_l_tip")
+    middle_start = middle.target.world_position
+    middle_context.service.move_controller(
+        middle_doc.autoposing,
+        "middle_l_tip",
+        (middle_start[0] + 10.0, middle_start[1] + 2.0, middle_start[2] - 14.0),
+    )
+    _solve_context(middle_context)
+    middle_hand_angle = _quaternion_angle_degrees(
+        _retarget_joint(middle_doc.retarget_pose, "hand_l").local_rotation,
+        _bone_from_skeleton(middle_doc.skeleton, "hand_l").rest_local_rotation,
+    )
+
+    passed = pinky_hand_angle > 0.1 and middle_hand_angle < 0.1
+    details = f"pinky_hand_angle={pinky_hand_angle:.3f}, middle_hand_angle={middle_hand_angle:.3f}"
+    return CheckResult("finger palm spread", passed, details)
+
+
+def _run_thumb_opposition_check() -> CheckResult:
+    context = _fresh_context()
+    document = context.document
+    context.service.set_fingers_enabled(document.autoposing, True)
+    thumb = _controller(document, "thumb_l_tip")
+    thumb_start = thumb.target.world_position
+    context.service.move_controller(
+        document.autoposing,
+        "thumb_l_tip",
+        (thumb_start[0] - 8.0, thumb_start[1] + 8.0, thumb_start[2] + 12.0),
+    )
+    pre_tip = _controller(document, "thumb_l_pre_tip")
+    pre_start = pre_tip.target.world_position
+    context.service.move_controller(
+        document.autoposing,
+        "thumb_l_pre_tip",
+        (pre_start[0] - 5.0, pre_start[1] + 6.0, pre_start[2] + 10.0),
+    )
+    _solve_context(context)
+
+    thumb_angle = _quaternion_angle_degrees(
+        _retarget_joint(document.retarget_pose, "thumb_01_l").local_rotation,
+        _bone_from_skeleton(document.skeleton, "thumb_01_l").rest_local_rotation,
+    )
+    index_angle = _quaternion_angle_degrees(
+        _retarget_joint(document.retarget_pose, "index_01_l").local_rotation,
+        _bone_from_skeleton(document.skeleton, "index_01_l").rest_local_rotation,
+    )
+    passed = thumb_angle > 0.5 and index_angle < 0.1
+    details = f"thumb_angle={thumb_angle:.3f}, index_angle={index_angle:.3f}"
+    return CheckResult("thumb opposition", passed, details)
+
+
+def _run_hand_finger_priority_check() -> CheckResult:
+    context = _fresh_context()
+    document = context.document
+    context.service.set_fingers_enabled(document.autoposing, True)
+    hand = _controller(document, "hand_l_additional")
+    hand_start = hand.target.world_position
+    context.service.move_controller(
+        document.autoposing,
+        "hand_l_additional",
+        (hand_start[0] - 35.0, hand_start[1] + 12.0, hand_start[2] + 24.0),
+    )
+    _solve_context(context)
+    hand_only_angle = _quaternion_angle_degrees(
+        _retarget_joint(document.retarget_pose, "hand_l").local_rotation,
+        _bone_from_skeleton(document.skeleton, "hand_l").rest_local_rotation,
+    )
+
+    index = _controller(document, "index_l_tip")
+    index_start = index.target.world_position
+    context.service.move_controller(
+        document.autoposing,
+        "index_l_tip",
+        (index_start[0] + 12.0, index_start[1] + 5.0, index_start[2] + 8.0),
+    )
+    _solve_context(context)
+    combined_angle = _quaternion_angle_degrees(
+        _retarget_joint(document.retarget_pose, "hand_l").local_rotation,
+        _bone_from_skeleton(document.skeleton, "hand_l").rest_local_rotation,
+    )
+    passed = hand_only_angle > 2.0 and abs(combined_angle - hand_only_angle) < 2.0
+    details = f"hand_only_angle={hand_only_angle:.3f}, combined_angle={combined_angle:.3f}"
+    return CheckResult("hand finger priority", passed, details)
+
+
+def _run_ball_roll_check() -> CheckResult:
+    context = _fresh_context()
+    document = context.document
+    initial_solved = context.service.solve_pose(document.autoposing, document.skeleton)
+    initial_foot = _joint_from_rig(initial_solved.rig, "foot_l").world_position
+    ball = _controller(document, "ball_l_lesser")
+    ball_start = ball.target.world_position
+    context.service.move_controller(
+        document.autoposing,
+        "ball_l_lesser",
+        (ball_start[0] + 90.0, ball_start[1] + 25.0, ball_start[2] + 80.0),
+    )
+    _solve_context(context)
+
+    solved_foot = _joint_from_rig(document.solver_rig, "foot_l").world_position
+    solved_ball = _joint_from_rig(document.solver_rig, "ball_l").world_position
+    effector = _effector(document.solved_pose, "ball_l_lesser")
+    foot_angle = _quaternion_angle_degrees(
+        _retarget_joint(document.retarget_pose, "foot_l").local_rotation,
+        _bone_from_skeleton(document.skeleton, "foot_l").rest_local_rotation,
+    )
+    ball_angle = _quaternion_angle_degrees(
+        _retarget_joint(document.retarget_pose, "ball_l").local_rotation,
+        _bone_from_skeleton(document.skeleton, "ball_l").rest_local_rotation,
+    )
+    anatomy = build_humanoid_anatomy_profile(document.skeleton)
+    foot_drift = distance(initial_foot, solved_foot)
+    passed = (
+        effector.clamped
+        and solved_ball[1] >= anatomy.floor_y
+        and foot_drift < 0.001
+        and foot_angle > 0.5
+        and ball_angle > 0.5
+    )
+    details = (
+        f"foot_drift={foot_drift:.6f}, ball_y={solved_ball[1]:.3f}, floor_y={anatomy.floor_y:.3f}, "
+        f"foot_angle={foot_angle:.3f}, ball_angle={ball_angle:.3f}, clamped={effector.clamped}"
+    )
+    return CheckResult("ball roll", passed, details)
+
+
+def _run_finger_reset_layout_check() -> CheckResult:
+    context = _fresh_context()
+    document = context.document
+    view_model = DocumentViewModel(document)
+    view_model.setAutoPosingDisplayMode("fingers")
+    view_model.unlockAutoPosingController("index_l_tip")
+
+    wrist = _controller(document, "wrist_l_main")
+    wrist_start = wrist.target.world_position
+    wrist_target = (wrist_start[0] - 30.0, wrist_start[1] + 18.0, wrist_start[2] + 12.0)
+    view_model.beginAutoPosingDrag("wrist_l_main")
+    view_model.previewAutoPosingController("wrist_l_main", *wrist_target)
+    view_model.endAutoPosingDrag("wrist_l_main")
+
+    index = _controller(document, "index_l_tip")
+    original_default = index.target.default_position
+    followed_target = index.target.world_position
+    view_model.beginAutoPosingDrag("index_l_tip")
+    view_model.previewAutoPosingController("index_l_tip", followed_target[0] + 15.0, followed_target[1] + 8.0, followed_target[2] + 12.0)
+    view_model.endAutoPosingDrag("index_l_tip")
+    view_model.resetAutoPosingController("index_l_tip")
+
+    reset_effector = _effector(document.preview_frame.solved_pose, "index_l_tip")
+    reset_target = index.target.world_position
+    target_near_effector = distance(reset_target, reset_effector.solved_world_position) < 0.001
+    did_not_jump_to_rest = distance(reset_target, original_default) > 1.0
+    passed = target_near_effector and did_not_jump_to_rest and not index.active
+    details = (
+        f"target_near_effector={target_near_effector}, did_not_jump_to_rest={did_not_jump_to_rest}, "
+        f"active={index.active}, rest_gap={distance(reset_target, original_default):.3f}"
+    )
+    return CheckResult("finger reset layout", passed, details)
+
+
 def main() -> int:
     _ensure_app()
     checks = [
@@ -593,10 +1333,32 @@ def main() -> int:
         _run_preview_pipeline_revision_check(),
         _run_viewmodel_preview_source_check(),
         _run_viewmodel_drag_signal_split_check(),
+        _run_normal_tether_filter_check(),
         _run_constraint_extraction_check(),
+        _run_constraint_influence_check(),
         _run_anatomy_profile_check(),
         _run_pose_prior_anatomy_check(),
         _run_support_rule_check(),
+        _run_shoulder_girdle_check(),
+        _run_support_stability_check(),
+        _run_visual_policy_check(),
+        _run_controller_schema_topology_check(),
+        _run_schema_layout_offset_check(),
+        _run_semantic_constraint_extraction_check(),
+        _run_bend_hint_semantics_check(),
+        _run_terminal_orientation_retarget_check(),
+        _run_body_orientation_hint_check(),
+        _run_direction_rods_check(),
+        _run_controller_menu_state_check(),
+        _run_lock_fix_layout_sync_check(),
+        _run_finger_schema_mode_check(),
+        _run_finger_tip_retarget_check(),
+        _run_finger_pre_tip_bend_check(),
+        _run_finger_palm_spread_check(),
+        _run_thumb_opposition_check(),
+        _run_hand_finger_priority_check(),
+        _run_ball_roll_check(),
+        _run_finger_reset_layout_check(),
     ]
 
     print("MCS AutoPosing self-check")

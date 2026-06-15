@@ -35,7 +35,27 @@ def move_controller(rig: AutoPosingRigModel, controller_id: str, world_position:
     return True
 
 
-def toggle_fixed(
+def lock_controller(rig: AutoPosingRigModel, controller_id: str) -> bool:
+    controller = controller_by_id(rig, controller_id)
+    if controller is None or controller.always_active:
+        return False
+
+    controller.active = True
+    select_controller(rig, controller_id)
+    return True
+
+
+def unlock_controller(rig: AutoPosingRigModel, controller_id: str) -> bool:
+    controller = controller_by_id(rig, controller_id)
+    if controller is None or controller.always_active:
+        return False
+
+    controller.active = False
+    select_controller(rig, controller_id)
+    return True
+
+
+def fix_controller(
     rig: AutoPosingRigModel,
     controller_id: str,
     display_world_position: Vec3 | None = None,
@@ -45,24 +65,52 @@ def toggle_fixed(
         return False
 
     was_engaged = controller_engaged(controller)
-    controller.fixed = not controller.fixed
-    if controller.fixed:
-        if not was_engaged and display_world_position is not None:
-            controller.target.world_position = display_world_position
-        controller.active = True
+    controller.fixed = True
+    if not was_engaged and display_world_position is not None:
+        controller.target.world_position = display_world_position
 
     select_controller(rig, controller_id)
-    return controller.fixed
+    return True
 
 
-def reset_controller(rig: AutoPosingRigModel, controller_id: str) -> bool:
+def unfix_controller(rig: AutoPosingRigModel, controller_id: str) -> bool:
     controller = controller_by_id(rig, controller_id)
     if controller is None:
         return False
 
-    controller.target.world_position = controller.target.default_position
-    controller.target.solved_world_position = controller.target.default_position
-    controller.target.clamped_world_position = controller.target.default_position
+    controller.fixed = False
+    select_controller(rig, controller_id)
+    return True
+
+
+def toggle_fixed(
+    rig: AutoPosingRigModel,
+    controller_id: str,
+    display_world_position: Vec3 | None = None,
+) -> bool:
+    controller = controller_by_id(rig, controller_id)
+    if controller is None:
+        return False
+    if controller.fixed:
+        unfix_controller(rig, controller_id)
+        return False
+    fix_controller(rig, controller_id, display_world_position)
+    return True
+
+
+def reset_controller(
+    rig: AutoPosingRigModel,
+    controller_id: str,
+    reset_world_position: Vec3 | None = None,
+) -> bool:
+    controller = controller_by_id(rig, controller_id)
+    if controller is None:
+        return False
+
+    reset_position = reset_world_position if reset_world_position is not None else controller.target.default_position
+    controller.target.world_position = reset_position
+    controller.target.solved_world_position = reset_position
+    controller.target.clamped_world_position = reset_position
     controller.target.pressure = 0.0
     controller.target.pressure_state = "normal"
     controller.target.clamped = False

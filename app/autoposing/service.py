@@ -1,89 +1,54 @@
 from core.autoposing.models import (
+    AutoPosingControllerEdgeModel,
     AutoPosingRigModel,
     ControllerTargetModel,
     SolvedPoseModel,
 )
+from core.math import add, distance, subtract
 from core.rig.models import RigModel
 from core.skeleton.models import BoneModel, SkeletonModel
 
 from .controller_state import (
     controller_state,
+    fix_controller,
+    lock_controller,
     move_controller,
     reset_controller,
     select_controller,
     set_mode,
     toggle_fixed,
+    unfix_controller,
+    unlock_controller,
 )
+from .controller_schema import AutoPosingControllerDefinition, build_cascadeur_like_controller_schema
+from .finger_profile import FINGER_ROLES, is_finger_controller_id
+from .finger_schema import build_finger_controller_schema
 from .solver import AutoPosingSolver
 
 
 class AutoPosingService:
-    _JOINT_ALIASES = {
-        "pelvis": ("pelvis",),
-        "chest": ("spine_05", "spine_04", "spine_03", "spine_02"),
-        "head": ("head",),
-        "wrist_l": ("hand_l",),
-        "wrist_r": ("hand_r",),
-        "elbow_l": ("lowerarm_l",),
-        "elbow_r": ("lowerarm_r",),
-        "ankle_l": ("foot_l",),
-        "ankle_r": ("foot_r",),
-        "knee_l": ("calf_l",),
-        "knee_r": ("calf_r",),
-    }
-    _FORWARD_OFFSET = {
-        "pelvis_dir": (0.0, 0.0, 24.0),
-        "chest_dir": (0.0, 6.0, 26.0),
-        "head_dir": (0.0, 0.0, 22.0),
-    }
-    _ALWAYS_ACTIVE_IDS = {"ankle_l_main", "ankle_r_main"}
-    _CONTROLLER_LAYOUT = (
-        ("pelvis_main", "Pelvis", "main", "pelvis"),
-        ("chest_secondary", "Chest", "secondary", "chest"),
-        ("head_main", "Head", "main", "head"),
-        ("wrist_l_main", "Wrist L", "main", "wrist_l"),
-        ("elbow_l_secondary", "Elbow L", "secondary", "elbow_l"),
-        ("wrist_r_main", "Wrist R", "main", "wrist_r"),
-        ("elbow_r_secondary", "Elbow R", "secondary", "elbow_r"),
-        ("ankle_l_main", "Ankle L", "main", "ankle_l"),
-        ("knee_l_secondary", "Knee L", "secondary", "knee_l"),
-        ("ankle_r_main", "Ankle R", "main", "ankle_r"),
-        ("knee_r_secondary", "Knee R", "secondary", "knee_r"),
-        ("pelvis_dir", "Pelvis Direction", "direction", "pelvis"),
-        ("chest_dir", "Chest Direction", "direction", "chest"),
-        ("head_dir", "Head Direction", "direction", "head"),
-    )
-
     def __init__(self) -> None:
         self._solver = AutoPosingSolver()
 
     def build_rig(self, skeleton: SkeletonModel) -> AutoPosingRigModel:
-        by_name = {bone.name: bone for bone in skeleton.bones}
-        controllers = []
-        for identifier, name, controller_type, semantic_joint in self._CONTROLLER_LAYOUT:
-            joint = self._resolve_joint(by_name, semantic_joint)
-            if joint is None:
-                continue
-
-            world_position = joint.rest_world_position
-            if controller_type == "direction":
-                offset = self._FORWARD_OFFSET.get(identifier, (0.0, 0.0, 20.0))
-                world_position = (
-                    world_position[0] + offset[0],
-                    world_position[1] + offset[1],
-                    world_position[2] + offset[2],
-                )
-
-            controllers.append(
-                self._controller_model(
-                    identifier=identifier,
-                    name=name,
-                    controller_type=controller_type,
-                    joint_name=joint.name,
-                    world_position=world_position,
-                )
+        schema = build_cascadeur_like_controller_schema(skeleton)
+        finger_schema = build_finger_controller_schema(skeleton)
+        controller_definitions = [*schema.controllers, *finger_schema.controllers]
+        edge_definitions = [*schema.edges, *finger_schema.edges]
+        controllers = [self._controller_model(definition) for definition in controller_definitions]
+        controller_positions = {controller.identifier: controller.target.world_position for controller in controllers}
+        edges = [
+            AutoPosingControllerEdgeModel(
+                start_controller_id=edge.start_controller_id,
+                end_controller_id=edge.end_controller_id,
+                edge_type=edge.edge_type,
+                rest_length=distance(controller_positions[edge.start_controller_id], controller_positions[edge.end_controller_id]),
+                visible=edge.visible,
             )
-        return AutoPosingRigModel(controllers=controllers, current_mode="view", selected_controller_id=None)
+            for edge in edge_definitions
+            if edge.start_controller_id in controller_positions and edge.end_controller_id in controller_positions
+        ]
+        return AutoPosingRigModel(controllers=controllers, controller_edges=edges, current_mode="view", selected_controller_id=None)
 
     def solve_pose(self, rig: AutoPosingRigModel, skeleton: SkeletonModel) -> SolvedPoseModel:
         solved_pose = self._solver.solve(rig, skeleton)
@@ -143,36 +108,99 @@ class AutoPosingService:
     ) -> bool:
         return toggle_fixed(rig, controller_id, display_world_position)
 
-    def reset_controller(self, rig: AutoPosingRigModel, controller_id: str) -> bool:
-        return reset_controller(rig, controller_id)
+    def reset_controller(
+        self,
+        rig: AutoPosingRigModel,
+        controller_id: str,
+        solved_pose: SolvedPoseModel | None = None,
+    ) -> bool:
+        controller = next((controller for controller in rig.controllers if controller.identifier == controller_id), None)
+        reset_position = self._reset_world_position(controller, solved_pose)
+        return reset_controller(rig, controller_id, reset_position)
+
+    def lock_controller(self, rig: AutoPosingRigModel, controller_id: str) -> bool:
+        return lock_controller(rig, controller_id)
+
+    def unlock_controller(self, rig: AutoPosingRigModel, controller_id: str) -> bool:
+        return unlock_controller(rig, controller_id)
+
+    def fix_controller(
+        self,
+        rig: AutoPosingRigModel,
+        controller_id: str,
+        display_world_position: tuple[float, float, float] | None = None,
+    ) -> bool:
+        return fix_controller(rig, controller_id, display_world_position)
+
+    def unfix_controller(self, rig: AutoPosingRigModel, controller_id: str) -> bool:
+        return unfix_controller(rig, controller_id)
 
     def controller_state(self, controller) -> str:
         return controller_state(controller)
 
-    @staticmethod
-    def _resolve_joint(by_name: dict[str, BoneModel], semantic_joint: str) -> BoneModel | None:
-        for alias in AutoPosingService._JOINT_ALIASES.get(semantic_joint, (semantic_joint,)):
-            joint = by_name.get(alias)
-            if joint is not None:
-                return joint
-        return None
+    def has_finger_controllers(self, rig: AutoPosingRigModel) -> bool:
+        return any(controller.role in FINGER_ROLES or is_finger_controller_id(controller.identifier) for controller in rig.controllers)
+
+    def set_fingers_enabled(self, rig: AutoPosingRigModel, enabled: bool) -> bool:
+        if not self.has_finger_controllers(rig):
+            enabled = False
+        if rig.fingers_enabled == enabled and (not enabled or rig.finger_defaults_initialized):
+            return False
+
+        rig.fingers_enabled = enabled
+        finger_ids = set()
+        for controller in rig.controllers:
+            if controller.role in FINGER_ROLES or is_finger_controller_id(controller.identifier):
+                controller.visible = enabled
+                finger_ids.add(controller.identifier)
+
+        for edge in rig.controller_edges:
+            if edge.start_controller_id in finger_ids or edge.end_controller_id in finger_ids:
+                edge.visible = enabled
+
+        if enabled and not rig.finger_defaults_initialized:
+            for controller in rig.controllers:
+                if controller.identifier in {"index_l_tip", "index_r_tip"}:
+                    controller.active = True
+            rig.finger_defaults_initialized = True
+
+        if not enabled and rig.selected_controller_id in finger_ids:
+            select_controller(rig, None)
+        return True
+
+    def toggle_fingers_enabled(self, rig: AutoPosingRigModel) -> bool:
+        return self.set_fingers_enabled(rig, not rig.fingers_enabled)
 
     @staticmethod
-    def _controller_model(identifier: str, name: str, controller_type: str, joint_name: str, world_position):
+    def _reset_world_position(controller, solved_pose: SolvedPoseModel | None):
+        if controller is None or solved_pose is None:
+            return None
+        if controller.role not in FINGER_ROLES and not is_finger_controller_id(controller.identifier):
+            return None
+        joint = next((joint for joint in solved_pose.rig.joints if joint.name == controller.joint_name), None)
+        if joint is None:
+            return None
+        offset = subtract(controller.target.default_position, joint.rest_world_position)
+        return add(joint.world_position, offset)
+
+    @staticmethod
+    def _controller_model(definition: AutoPosingControllerDefinition):
         from core.autoposing.models import AutoPosingControllerModel
 
         return AutoPosingControllerModel(
-            identifier=identifier,
-            name=name,
-            controller_type=controller_type,
-            joint_name=joint_name,
+            identifier=definition.identifier,
+            name=definition.name,
+            controller_type=definition.role,
+            role=definition.role,
+            joint_name=definition.joint_name,
             target=ControllerTargetModel(
-                controller_id=identifier,
-                world_position=world_position,
-                default_position=world_position,
-                solved_world_position=world_position,
-                clamped_world_position=world_position,
+                controller_id=definition.identifier,
+                world_position=definition.world_position,
+                default_position=definition.world_position,
+                solved_world_position=definition.world_position,
+                clamped_world_position=definition.world_position,
             ),
-            active=identifier in AutoPosingService._ALWAYS_ACTIVE_IDS,
-            always_active=identifier in AutoPosingService._ALWAYS_ACTIVE_IDS,
+            visible=definition.visible,
+            active=definition.always_active,
+            always_active=definition.always_active,
         )

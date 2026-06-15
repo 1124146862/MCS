@@ -20,7 +20,7 @@ from core.math import (
 from core.skeleton.models import BoneModel, SkeletonModel, Vec3
 
 from .finger_profile import build_finger_anatomy_profile
-from .joint_rules import AnkleRule, FootRollRule, ForearmRule, JointRuleResult, WristRule
+from .joint_rules import AnkleRule, FootRollRule, ForearmRule, JointRuleResult, NeckHeadRule, SpineRule, WristRule
 
 
 class RuntimeRetargeter:
@@ -89,6 +89,8 @@ class RuntimeRetargeter:
         self._wrist_rule = WristRule()
         self._ankle_rule = AnkleRule()
         self._foot_rule = FootRollRule()
+        self._spine_rule = SpineRule()
+        self._neck_rule = NeckHeadRule()
         self.last_joint_rule_results: dict[str, JointRuleResult] = {}
 
     def retarget(self, rig: AutoPosingRigModel, solved_pose: SolvedPoseModel, skeleton: SkeletonModel) -> RetargetPoseModel:
@@ -125,6 +127,12 @@ class RuntimeRetargeter:
             )
             desired_world_rotations[name] = desired_world_rotation
             local_rotation = quaternion_multiply(inverse_quaternion(parent_rotation), desired_world_rotation)
+            trunk_rule = self._trunk_rule_result(bone, local_rotation, controllers_by_id)
+            if trunk_rule is not None:
+                local_rotation = normalize_quaternion(quaternion_multiply(trunk_rule.rotation, bone.rest_local_rotation))
+                desired_world_rotation = normalize_quaternion(quaternion_multiply(parent_rotation, local_rotation))
+                desired_world_rotations[name] = desired_world_rotation
+                self._record_trunk_rule_result(name, trunk_rule)
             world_position = solved_by_name[name].world_position if name == "pelvis" and name in solved_by_name else None
             pose_map[name] = RetargetJointPoseModel(
                 name=name,
@@ -232,6 +240,64 @@ class RuntimeRetargeter:
 
         return RetargetPoseModel(joints=list(pose_map.values()), status_message=solved_pose.status_message)
 
+    def _trunk_rule_result(
+        self,
+        bone: BoneModel,
+        local_rotation,
+        controllers_by_id: dict[str, object],
+    ) -> JointRuleResult | None:
+        if bone.name not in {"pelvis", "spine_01", "spine_02", "spine_03", "spine_04", "spine_05", "neck_01", "neck_02", "head"}:
+            return None
+        local_delta = quaternion_multiply(local_rotation, inverse_quaternion(bone.rest_local_rotation))
+        flexion_axis = self._local_flexion_axis(bone)
+        lateral_axis = self._local_lateral_axis(bone, flexion_axis)
+        if bone.name in {"pelvis", "spine_01", "spine_02", "spine_03", "spine_04", "spine_05"}:
+            return self._spine_rule.solve(
+                local_delta,
+                bone.primary_axis,
+                flexion_axis=flexion_axis,
+                lateral_axis=lateral_axis,
+                label=bone.name,
+            )
+        if bone.name in {"neck_01", "neck_02"}:
+            return self._neck_rule.solve_neck(
+                local_delta,
+                bone.primary_axis,
+                flexion_axis=flexion_axis,
+                lateral_axis=lateral_axis,
+            )
+        directed = self._head_direction_engaged(controllers_by_id)
+        if not directed:
+            local_delta = (1.0, 0.0, 0.0, 0.0)
+        return self._neck_rule.solve_head(
+            local_delta,
+            bone.primary_axis,
+            flexion_axis=flexion_axis,
+            lateral_axis=lateral_axis,
+            directed=directed,
+        )
+
+    def _record_trunk_rule_result(self, bone_name: str, result: JointRuleResult) -> None:
+        if bone_name == "pelvis":
+            self._store_rule_result("pelvis", result)
+        elif bone_name.startswith("spine_"):
+            self._store_rule_result("spine", result)
+        elif bone_name.startswith("neck_"):
+            self._store_rule_result("neck", result)
+        elif bone_name == "head":
+            self._store_rule_result("head", result)
+
+    def _store_rule_result(self, key: str, result: JointRuleResult) -> None:
+        previous = self.last_joint_rule_results.get(key)
+        if previous is None or result.pressure >= previous.pressure:
+            self.last_joint_rule_results[key] = result
+
+    @staticmethod
+    def _head_direction_engaged(controllers_by_id: dict[str, object]) -> bool:
+        return RuntimeRetargeter._controller_engaged(controllers_by_id.get("head_dir")) or RuntimeRetargeter._controller_engaged(
+            controllers_by_id.get("head_additional")
+        )
+
     def _solve_world_rotation(
         self,
         bone: BoneModel,
@@ -296,6 +362,14 @@ class RuntimeRetargeter:
         if bone.name == "hand_r":
             return None
         if bone.name == "head":
+            direction_rotation = self._terminal_rotation_from_direction_controller(
+                bone,
+                solved_by_name,
+                controllers_by_id,
+                "head_dir",
+            )
+            if direction_rotation is not None:
+                return direction_rotation
             return self._terminal_rotation_from_controller(
                 bone,
                 solved_by_name,
@@ -304,6 +378,24 @@ class RuntimeRetargeter:
                 ("head_additional",),
             )
         return None
+
+    def _terminal_rotation_from_direction_controller(
+        self,
+        bone: BoneModel,
+        solved_by_name: dict[str, object],
+        controllers_by_id: dict[str, object],
+        controller_id: str,
+    ):
+        controller = controllers_by_id.get(controller_id)
+        origin = solved_by_name.get(bone.name)
+        if not self._controller_engaged(controller) or origin is None:
+            return None
+        desired_secondary = normalize(subtract(controller.target.world_position, origin.world_position))
+        rest_secondary = normalize(rotate_vector(bone.rest_world_rotation, (0.0, 0.0, 1.0)))
+        if rest_secondary == (0.0, 0.0, 0.0) or desired_secondary == (0.0, 0.0, 0.0):
+            return None
+        delta_rotation = rotation_between_vectors(rest_secondary, desired_secondary)
+        return normalize_quaternion(quaternion_multiply(delta_rotation, bone.rest_world_rotation))
 
     def _apply_wrist_forearm_rules(
         self,
@@ -636,6 +728,9 @@ class RuntimeRetargeter:
         rest_by_name: dict[str, BoneModel],
     ) -> Vec3:
         if bone_name == "pelvis":
+            direction_controller = controllers_by_id.get("pelvis_dir")
+            if self._controller_engaged(direction_controller):
+                return subtract(direction_controller.target.world_position, solved_by_name[bone_name].world_position)
             additional = self._engaged_effector_vector(
                 ("pelvis_additional",),
                 bone_name,
@@ -645,11 +740,11 @@ class RuntimeRetargeter:
             )
             if additional is not None:
                 return additional
-            direction_controller = controllers_by_id.get("pelvis_dir")
-            if self._controller_engaged(direction_controller):
-                return subtract(direction_controller.target.world_position, solved_by_name[bone_name].world_position)
             return self._pair_vector_from_solved(solved_by_name, "thigh_l", "thigh_r", rest_by_name[bone_name].rest_world_rotation)
         if bone_name in {"spine_01", "spine_02", "spine_03", "spine_04", "spine_05"}:
+            direction_controller = controllers_by_id.get("chest_dir")
+            if self._controller_engaged(direction_controller) and bone_name == "spine_05":
+                return subtract(direction_controller.target.world_position, solved_by_name[bone_name].world_position)
             if bone_name == "spine_05":
                 additional = self._engaged_effector_vector(
                     ("chest_additional",),
@@ -660,11 +755,11 @@ class RuntimeRetargeter:
                 )
                 if additional is not None:
                     return additional
-            direction_controller = controllers_by_id.get("chest_dir")
-            if self._controller_engaged(direction_controller) and bone_name == "spine_05":
-                return subtract(direction_controller.target.world_position, solved_by_name[bone_name].world_position)
             return self._pair_vector_from_solved(solved_by_name, "clavicle_l", "clavicle_r", rest_by_name[bone_name].rest_world_rotation)
         if bone_name in {"neck_01", "neck_02", "head"}:
+            direction_controller = controllers_by_id.get("head_dir")
+            if self._controller_engaged(direction_controller):
+                return subtract(direction_controller.target.world_position, solved_by_name[bone_name].world_position)
             if bone_name == "head":
                 additional = self._engaged_effector_vector(
                     ("head_additional",),
@@ -675,9 +770,6 @@ class RuntimeRetargeter:
                 )
                 if additional is not None:
                     return additional
-            direction_controller = controllers_by_id.get("head_dir")
-            if self._controller_engaged(direction_controller):
-                return subtract(direction_controller.target.world_position, solved_by_name[bone_name].world_position)
         if bone_name.startswith("upperarm"):
             hint = effectors_by_id.get("elbow_l_secondary" if bone_name.endswith("_l") else "elbow_r_secondary")
             if hint is not None:
@@ -732,6 +824,22 @@ class RuntimeRetargeter:
     def _local_delta_from_world(self, bone: BoneModel, parent_world_rotation, desired_world_rotation):
         local_rotation = normalize_quaternion(quaternion_multiply(inverse_quaternion(parent_world_rotation), desired_world_rotation))
         return normalize_quaternion(quaternion_multiply(local_rotation, inverse_quaternion(bone.rest_local_rotation)))
+
+    @staticmethod
+    def _local_flexion_axis(bone: BoneModel) -> Vec3:
+        axis = normalize(project_on_plane((1.0, 0.0, 0.0), bone.primary_axis))
+        if length(axis) > 1e-6:
+            return axis
+        axis = normalize(project_on_plane((0.0, 0.0, 1.0), bone.primary_axis))
+        return axis if length(axis) > 1e-6 else (1.0, 0.0, 0.0)
+
+    @staticmethod
+    def _local_lateral_axis(bone: BoneModel, flexion_axis: Vec3) -> Vec3:
+        axis = normalize(project_on_plane((0.0, 0.0, 1.0), bone.primary_axis))
+        if length(axis) > 1e-6 and abs(sum(axis[index] * flexion_axis[index] for index in range(3))) < 0.95:
+            return axis
+        axis = normalize(project_on_plane((0.0, 1.0, 0.0), bone.primary_axis))
+        return axis if length(axis) > 1e-6 else (0.0, 0.0, 1.0)
 
     @staticmethod
     def _foot_flexion_axis(bone: BoneModel) -> Vec3:

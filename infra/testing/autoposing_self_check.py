@@ -14,6 +14,8 @@ from app.autoposing.joint_rules.ankle import AnkleRule
 from app.autoposing.joint_rules.elbow import ElbowRule
 from app.autoposing.joint_rules.foot import FootRollRule
 from app.autoposing.joint_rules.knee import KneeRule
+from app.autoposing.joint_rules.neck import NeckHeadRule
+from app.autoposing.joint_rules.spine import SpineRule
 from app.autoposing.pose_prior import PosePriorEstimator
 from app.autoposing.preview_pipeline import AutoPosingPreviewPipeline
 from app.autoposing.runtime_retargeter import RuntimeRetargeter
@@ -184,6 +186,28 @@ def _solve_context(context: CheckContext) -> SkeletonModel | None:
 def _chain_length_error(rest: SkeletonModel, solved: RigModel) -> float:
     max_error = 0.0
     for parent_name, child_name in _CHECKED_LIMB_CHAINS:
+        rest_parent = _bone_from_skeleton(rest, parent_name)
+        rest_child = _bone_from_skeleton(rest, child_name)
+        solved_parent = _joint_from_rig(solved, parent_name)
+        solved_child = _joint_from_rig(solved, child_name)
+        rest_length = distance(rest_parent.rest_world_position, rest_child.rest_world_position)
+        solved_length = distance(solved_parent.world_position, solved_child.world_position)
+        max_error = max(max_error, abs(rest_length - solved_length))
+    return max_error
+
+
+def _spine_chain_length_error(rest: SkeletonModel, solved: RigModel) -> float:
+    max_error = 0.0
+    for parent_name, child_name in (
+        ("pelvis", "spine_01"),
+        ("spine_01", "spine_02"),
+        ("spine_02", "spine_03"),
+        ("spine_03", "spine_04"),
+        ("spine_04", "spine_05"),
+        ("spine_05", "neck_01"),
+        ("neck_01", "neck_02"),
+        ("neck_02", "head"),
+    ):
         rest_parent = _bone_from_skeleton(rest, parent_name)
         rest_child = _bone_from_skeleton(rest, child_name)
         solved_parent = _joint_from_rig(solved, parent_name)
@@ -1448,6 +1472,180 @@ def _run_foot_roll_rule_check() -> CheckResult:
     return CheckResult("foot roll rule", passed, details)
 
 
+def _run_spine_neck_rule_check() -> CheckResult:
+    spine_rule = SpineRule()
+    neck_rule = NeckHeadRule()
+    spine_axis = (0.0, 1.0, 0.0)
+    flexion_axis = (1.0, 0.0, 0.0)
+    lateral_axis = (0.0, 0.0, 1.0)
+    flexion = spine_rule.solve(
+        quaternion_angle_axis(math.radians(130.0), flexion_axis),
+        spine_axis,
+        flexion_axis=flexion_axis,
+        lateral_axis=lateral_axis,
+    )
+    extension = spine_rule.solve(
+        quaternion_angle_axis(math.radians(70.0), (-1.0, 0.0, 0.0)),
+        spine_axis,
+        flexion_axis=flexion_axis,
+        lateral_axis=lateral_axis,
+    )
+    lateral = spine_rule.solve(
+        quaternion_angle_axis(math.radians(80.0), lateral_axis),
+        spine_axis,
+        flexion_axis=flexion_axis,
+        lateral_axis=lateral_axis,
+    )
+    twist = spine_rule.solve(
+        quaternion_angle_axis(math.radians(80.0), spine_axis),
+        spine_axis,
+        flexion_axis=flexion_axis,
+        lateral_axis=lateral_axis,
+    )
+    neck = neck_rule.solve_neck(
+        quaternion_angle_axis(math.radians(120.0), spine_axis),
+        spine_axis,
+        flexion_axis=flexion_axis,
+        lateral_axis=lateral_axis,
+    )
+    head_upright = neck_rule.solve_head(
+        quaternion_angle_axis(math.radians(70.0), spine_axis),
+        spine_axis,
+        flexion_axis=flexion_axis,
+        lateral_axis=lateral_axis,
+        directed=False,
+    )
+    head_directed = neck_rule.solve_head(
+        quaternion_angle_axis(math.radians(70.0), spine_axis),
+        spine_axis,
+        flexion_axis=flexion_axis,
+        lateral_axis=lateral_axis,
+        directed=True,
+    )
+    passed = (
+        flexion.pressure_state == "stretch"
+        and flexion.debug_angles["spine_swing_applied_degrees"] <= 90.5
+        and extension.pressure_state == "stretch"
+        and extension.debug_angles["spine_swing_applied_degrees"] <= 30.5
+        and lateral.pressure_state == "stretch"
+        and lateral.debug_angles["spine_swing_applied_degrees"] <= 30.5
+        and twist.pressure_state == "stretch"
+        and abs(twist.debug_angles["spine_axial_applied_degrees"]) <= 30.5
+        and neck.pressure_state == "stretch"
+        and abs(neck.debug_angles["neck_axial_applied_degrees"]) <= 80.5
+        and head_upright.pressure_state == "stretch"
+        and abs(head_upright.debug_angles["head_axial_applied_degrees"]) <= 20.5
+        and abs(head_directed.debug_angles["head_axial_applied_degrees"]) <= 45.5
+    )
+    details = (
+        f"spine=({flexion.debug_angles['spine_swing_applied_degrees']:.1f}/"
+        f"{extension.debug_angles['spine_swing_applied_degrees']:.1f}/"
+        f"{lateral.debug_angles['spine_swing_applied_degrees']:.1f}/"
+        f"{twist.debug_angles['spine_axial_applied_degrees']:.1f}), "
+        f"neck={neck.debug_angles['neck_axial_applied_degrees']:.1f}, "
+        f"head=({head_upright.debug_angles['head_axial_applied_degrees']:.1f}/"
+        f"{head_directed.debug_angles['head_axial_applied_degrees']:.1f})"
+    )
+    return CheckResult("spine neck rule", passed, details)
+
+
+def _run_spine_solver_midline_check() -> CheckResult:
+    context = _fresh_context()
+    document = context.document
+    stomach = _controller(document, "stomach_secondary")
+    stomach_start = stomach.target.world_position
+    chest = _controller(document, "chest_secondary")
+    chest_start = chest.target.world_position
+    head = _controller(document, "head_main")
+    head_start = head.target.world_position
+    context.service.move_controller(document.autoposing, "stomach_secondary", (stomach_start[0] + 16.0, stomach_start[1] + 6.0, stomach_start[2] + 18.0))
+    context.service.move_controller(document.autoposing, "chest_secondary", (chest_start[0] + 28.0, chest_start[1] + 14.0, chest_start[2] + 22.0))
+    context.service.move_controller(document.autoposing, "head_main", (head_start[0] + 18.0, head_start[1] + 8.0, head_start[2] + 20.0))
+    _solve_context(context)
+
+    solved_stomach = _joint_from_rig(document.solver_rig, stomach.joint_name)
+    solved_chest = _joint_from_rig(document.solver_rig, "spine_05")
+    solved_head = _joint_from_rig(document.solver_rig, "head")
+    stomach_motion = distance(solved_stomach.world_position, _bone_from_skeleton(document.skeleton, stomach.joint_name).rest_world_position)
+    chest_motion = distance(solved_chest.world_position, _bone_from_skeleton(document.skeleton, "spine_05").rest_world_position)
+    head_motion = distance(solved_head.world_position, _bone_from_skeleton(document.skeleton, "head").rest_world_position)
+    length_error = _spine_chain_length_error(document.skeleton, document.solver_rig)
+    passed = stomach_motion > 1.0 and chest_motion > 5.0 and head_motion > 5.0 and length_error <= 0.0015
+    details = (
+        f"motion=({stomach_motion:.3f}/{chest_motion:.3f}/{head_motion:.3f}), "
+        f"length_error={length_error:.6f}"
+    )
+    return CheckResult("spine solver midline", passed, details)
+
+
+def _run_spine_neck_retarget_check() -> CheckResult:
+    context = _fresh_context()
+    document = context.document
+    pelvis_add = _controller(document, "pelvis_additional")
+    pelvis_start = pelvis_add.target.world_position
+    chest_add = _controller(document, "chest_additional")
+    chest_start = chest_add.target.world_position
+    head_add = _controller(document, "head_additional")
+    head_start = head_add.target.world_position
+    context.service.move_controller(document.autoposing, "pelvis_additional", (pelvis_start[0] + 42.0, pelvis_start[1] + 8.0, pelvis_start[2] + 18.0))
+    context.service.move_controller(document.autoposing, "chest_additional", (chest_start[0] + 52.0, chest_start[1] + 12.0, chest_start[2] + 30.0))
+    context.service.move_controller(document.autoposing, "head_additional", (head_start[0] + 34.0, head_start[1] + 16.0, head_start[2] + 28.0))
+    _solve_context(context)
+
+    pelvis_angle = _quaternion_angle_degrees(
+        _retarget_joint(document.retarget_pose, "pelvis").local_rotation,
+        _bone_from_skeleton(document.skeleton, "pelvis").rest_local_rotation,
+    )
+    chest_angle = _quaternion_angle_degrees(
+        _retarget_joint(document.retarget_pose, "spine_05").local_rotation,
+        _bone_from_skeleton(document.skeleton, "spine_05").rest_local_rotation,
+    )
+    head_angle = _quaternion_angle_degrees(
+        _retarget_joint(document.retarget_pose, "head").local_rotation,
+        _bone_from_skeleton(document.skeleton, "head").rest_local_rotation,
+    )
+    rule_keys_ok = all(key in context.retargeter.last_joint_rule_results for key in ("pelvis", "spine", "neck", "head"))
+
+    default_context = _fresh_context()
+    default_doc = default_context.document
+    chest_dir = _controller(default_doc, "chest_dir")
+    chest_dir_start = chest_dir.target.world_position
+    default_context.service.move_controller(default_doc.autoposing, "chest_dir", (chest_dir_start[0] + 80.0, chest_dir_start[1] + 22.0, chest_dir_start[2] + 64.0))
+    _solve_context(default_context)
+    default_head_angle = _quaternion_angle_degrees(
+        _retarget_joint(default_doc.retarget_pose, "head").local_rotation,
+        _bone_from_skeleton(default_doc.skeleton, "head").rest_local_rotation,
+    )
+
+    directed_context = _fresh_context()
+    directed_doc = directed_context.document
+    head_dir = _controller(directed_doc, "head_dir")
+    head_dir_start = head_dir.target.world_position
+    directed_context.service.move_controller(directed_doc.autoposing, "head_dir", (head_dir_start[0] + 46.0, head_dir_start[1] + 18.0, head_dir_start[2] + 70.0))
+    _solve_context(directed_context)
+    directed_head_angle = _quaternion_angle_degrees(
+        _retarget_joint(directed_doc.retarget_pose, "head").local_rotation,
+        _bone_from_skeleton(directed_doc.skeleton, "head").rest_local_rotation,
+    )
+    directed_keys_ok = "head" in directed_context.retargeter.last_joint_rule_results and "neck" in directed_context.retargeter.last_joint_rule_results
+
+    passed = (
+        pelvis_angle > 1.0
+        and chest_angle > 1.0
+        and head_angle > 1.0
+        and rule_keys_ok
+        and default_head_angle < 0.5
+        and directed_head_angle > 1.0
+        and directed_keys_ok
+    )
+    details = (
+        f"angles=({pelvis_angle:.2f}/{chest_angle:.2f}/{head_angle:.2f}), "
+        f"default_head={default_head_angle:.2f}, directed_head={directed_head_angle:.2f}, "
+        f"keys={sorted(context.retargeter.last_joint_rule_results.keys())}"
+    )
+    return CheckResult("spine neck retarget", passed, details)
+
+
 def _run_body_orientation_hint_check() -> CheckResult:
     context = _fresh_context()
     document = context.document
@@ -1855,6 +2053,9 @@ def main() -> int:
         _run_wrist_forearm_rule_check(),
         _run_ankle_rule_check(),
         _run_foot_roll_rule_check(),
+        _run_spine_neck_rule_check(),
+        _run_spine_solver_midline_check(),
+        _run_spine_neck_retarget_check(),
         _run_body_orientation_hint_check(),
         _run_direction_rods_check(),
         _run_controller_menu_state_check(),

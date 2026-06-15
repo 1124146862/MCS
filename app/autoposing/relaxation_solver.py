@@ -223,7 +223,8 @@ class WholeBodyRelaxationSolver:
         right_ankle_target: Vec3,
         shoulder_result: ShoulderGirdleResult | None = None,
     ) -> tuple[dict[str, Vec3], dict[str, SolvedLimb]]:
-        spine_positions = self._spine_solver.solve_spine_and_head(anatomy, pelvis, chest_target, head_target)
+        spine_result = self._spine_solver.solve_spine_and_head(anatomy, constraints, pelvis, chest_target, head_target)
+        spine_positions = spine_result.positions
         clavicle_l = self._clavicle_position(anatomy, shoulder_result, "l", spine_positions.get("spine_05", chest_target))
         clavicle_r = self._clavicle_position(anatomy, shoulder_result, "r", spine_positions.get("spine_05", chest_target))
         upperarm_l_start = anatomy.offset("clavicle_l", "upperarm_l", clavicle_l)
